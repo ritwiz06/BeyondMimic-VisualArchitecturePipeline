@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>How BeyondMimic works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{box-sizing:border-box;color-scheme:light;
+ --bg:#EEF2F6;--panel:#FFFFFF;--ink:#17202B;--muted:#5E6A77;--line:#D6DEE6;--band:#E6ECF2;--accent:#0F8577;--soft:#F5F8FA;
+ --floor:#E3E9EE;--grid:#C9D3DC;--robot:#0E7C70;--robot-far:#5FA9A0;--joint:#F4F8FA;--visor:#BFF3EA;--ghost:#E0567A;--past:#7A52D6;--plan:#0E8F80;--cost:#E2861F;--danger:#D64545;--shadow:#1B2A36;
+ --shell:#EEF2F5;--shell-far:#C8D0D8;--frame:#262D35;--frame-far:#56606B;--glow:#22C3EE;--tile:#DDE4EA;--sky:#F7F9FB;--danger-soft:#F6C9C9;--zero:#EEF1F4;--pos:#0E8F80;--neg:#E2761F;--flow:#9ACFC8;--flow2:#F2B97A}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#0F151B;--panel:#17212B;--ink:#E6EDF2;--muted:#93A1AE;--line:#2A3743;--band:#141D26;--accent:#35C2AE;--soft:#1C2833;
+ --floor:#16202A;--grid:#26333F;--robot:#35C2AE;--robot-far:#1F7A6E;--joint:#0F171E;--visor:#0F171E;--ghost:#FF7C9C;--past:#A98BFF;--plan:#35C2AE;--cost:#F2B04A;--danger:#FF6B6B;--shadow:#000000;
+ --shell:#D9E0E6;--shell-far:#8B97A3;--frame:#0B1015;--frame-far:#3A4652;--glow:#45D9FF;--tile:#1B2631;--sky:#121A22;--danger-soft:#E89A9A;--zero:#24313D;--pos:#35C2AE;--neg:#F29A4A;--flow:#2E6E66;--flow2:#8A5A2B}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#0F151B;--panel:#17212B;--ink:#E6EDF2;--muted:#93A1AE;--line:#2A3743;--band:#141D26;--accent:#35C2AE;--soft:#1C2833;
+ --floor:#16202A;--grid:#26333F;--robot:#35C2AE;--robot-far:#1F7A6E;--joint:#0F171E;--visor:#0F171E;--ghost:#FF7C9C;--past:#A98BFF;--plan:#35C2AE;--cost:#F2B04A;--danger:#FF6B6B;--shadow:#000000;
+ --shell:#D9E0E6;--shell-far:#8B97A3;--frame:#0B1015;--frame-far:#3A4652;--glow:#45D9FF;--tile:#1B2631;--sky:#121A22;--danger-soft:#E89A9A;--zero:#24313D;--pos:#35C2AE;--neg:#F29A4A;--flow:#2E6E66;--flow2:#8A5A2B}
+*,*::before,*::after{box-sizing:inherit}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font-family:"Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
+#stage{position:fixed;inset:0}
+#c{position:absolute;inset:0;width:100%;height:100%;cursor:pointer;touch-action:manipulation}
+.ctl{position:fixed;right:max(18px,env(safe-area-inset-right,0px));top:calc(14px + env(safe-area-inset-top,0px));display:flex;gap:8px;align-items:center;z-index:2}
+.ctl button{font:inherit;font-size:14px;font-weight:600;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;padding:8px 14px;cursor:pointer}
+.ctl button.accent{background:var(--accent);border-color:var(--accent);color:var(--panel)}
+.ctl button:disabled{opacity:.4;cursor:default}
+.ctl [hidden]{display:none}
+.ctl .count{font-size:13px;color:var(--muted);font-weight:600;min-width:72px;text-align:center;font-variant-numeric:tabular-nums}
+:focus-visible{outline:3px solid var(--cost);outline-offset:2px}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" role="img" aria-label="Animated, click-through build of the BeyondMimic architecture"></canvas></div>
+<div class="ctl"><button id="back" type="button">Back</button><span class="count" id="count">Start</span><button id="next" class="accent" type="button">Start</button><button id="theme" type="button" aria-label="Toggle dark theme">◐</button></div>
+<script>
+(function () {
+"use strict";
+// ---- toy guided-diffusion planner (shared by the page and the node test) ----
+const H = 16, DT = 0.04, K = 20;           // 16 future steps at 25 Hz = 0.64 s, 20 denoising steps
+function rng(seed) { let s = seed >>> 0 || 1; return () => { s ^= s << 13; s >>>= 0; s ^= s >> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
+function gauss(r) { let u = 0, v = 0; while (u === 0) u = r(); v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+// "clean guess": a smooth, human-paced continuation of the current motion (stands in for the trained denoiser)
+function priorClean(x, p0, v0, vmax, mom) {
+  const y = x.map(p => [p[0], p[1]]);
+  for (let it = 0; it < 6; it++) {
+    for (let i = 0; i < H; i++) {
+      const prev = i === 0 ? p0 : y[i - 1];
+      const next = i === H - 1 ? [2 * y[i][0] - prev[0], 2 * y[i][1] - prev[1]] : y[i + 1];
+      y[i][0] = 0.5 * y[i][0] + 0.25 * (prev[0] + next[0]);
+      y[i][1] = 0.5 * y[i][1] + 0.25 * (prev[1] + next[1]);
+    }
+  }
+  for (let i = 0; i < H; i++) {               // momentum: early steps continue the current velocity
+    const m = (mom === undefined ? 0.55 : mom) * Math.exp(-i / 5);
+    y[i][0] += m * (p0[0] + v0[0] * DT * (i + 1) - y[i][0]);
+    y[i][1] += m * (p0[1] + v0[1] * DT * (i + 1) - y[i][1]);
+  }
+  let prev = p0;                              // human walking pace: step length capped
+  for (let i = 0; i < H; i++) {
+    let dx = y[i][0] - prev[0], dz = y[i][1] - prev[1]; const L = Math.hypot(dx, dz), cap = vmax * DT;
+    if (L > cap) { dx *= cap / L; dz *= cap / L; }
+    y[i] = [prev[0] + dx, prev[1] + dz]; prev = y[i];
+  }
+  return y;
+}
+// gradient of the task cost G (waypoint + obstacle), as in the paper's cost terms
+function costGrad(x, p0, task) {
+  const g = x.map(() => [0, 0]);
+  if (task.goal) {
+    const [gx, gz] = task.goal;
+    for (let i = 0; i < H; i++) {
+      const dx = x[i][0] - gx, dz = x[i][1] - gz, d = Math.hypot(dx, dz), w = Math.exp(-2 * d);
+      g[i][0] += 2 * (1 - w) * dx; g[i][1] += 2 * (1 - w) * dz;                 // go to the goal
+      const prev = i === 0 ? p0 : x[i - 1], vx = (x[i][0] - prev[0]) / DT, vz = (x[i][1] - prev[1]) / DT;
+      g[i][0] += task.wSlow * w * vx; g[i][1] += task.wSlow * w * vz;                       // slow down near it
+      if (i > 0) { g[i - 1][0] -= task.wSlow * w * vx; g[i - 1][1] -= task.wSlow * w * vz; }
+    }
+  }
+  for (const o of (task.obstacles || [])) {
+    for (let i = 0; i < H; i++) {
+      const dx = x[i][0] - o.x, dz = x[i][1] - o.z, r = Math.hypot(dx, dz) || 1e-6, c = r - o.r - task.body, d0 = 0.12;
+      const cm = task.reach || 0.5; if (c > cm) continue;                                  // barrier acts only near the obstacle
+      const dB = c >= d0 ? -1 / c : (c - 2 * d0) / (d0 * d0);                     // relaxed log barrier
+      g[i][0] += task.wObs * dB * dx / r; g[i][1] += task.wObs * dB * dz / r;
+    }
+  }
+  return g;
+}
+function costValue(x, task) {
+  let G = 0;
+  if (task.goal) for (const p of x) { const d = Math.hypot(p[0] - task.goal[0], p[1] - task.goal[1]); G += (1 - Math.exp(-2 * d)) * d * d; }
+  for (const o of (task.obstacles || [])) for (const p of x) { const c = Math.hypot(p[0] - o.x, p[1] - o.z) - o.r - task.body, cm = task.reach || 0.5; if (c > cm) continue; G += c >= 0.12 ? -Math.log(c / cm) : -Math.log(0.12 / cm) + 0.5 * (((c - 0.24) / 0.12) ** 2 - 1); }
+  return G;
+}
+// reverse diffusion: start from noise, 20 steps; each step moves toward the clean guess and down the cost gradient
+function planTrajectory(p0, v0, task, r, opts) {
+  opts = opts || {}; const vmax = opts.vmax || 0.95, guide = opts.guide === undefined ? 1 : opts.guide, trace = opts.trace ? [] : null;
+  const dir = Math.hypot(v0[0], v0[1]) > 0.05 ? [v0[0], v0[1]] : (opts.heading || [0, 1]);
+  let x = [];
+  for (let i = 0; i < H; i++) x.push([p0[0] + dir[0] * 0.0 + gauss(r) * 0.45, p0[1] + gauss(r) * 0.45]);
+  if (trace) trace.push(x.map(p => p.slice()));
+  for (let k = K; k >= 1; k--) {
+    const a = k / K, clean = priorClean(x, p0, v0, vmax, opts.momentum), g = guide ? costGrad(clean, p0, task) : null;
+    const gamma = 0.32 + 0.4 * (1 - a), sig = 0.06 * a * a, lam = 0.0045 * guide;
+    for (let i = 0; i < H; i++) {
+      x[i][0] += gamma * (clean[i][0] - x[i][0]) + sig * gauss(r) - (g ? lam * g[i][0] : 0);
+      x[i][1] += gamma * (clean[i][1] - x[i][1]) + sig * gauss(r) - (g ? lam * g[i][1] : 0);
+    }
+    if (task.joy) {                                   // joystick cost 1/2 sum |V_i - g|^2, applied to each step's velocity
+      const kj = (task.wJoy || 0.25) * guide; let prev = p0, acc = [p0[0], p0[1]];
+      for (let i = 0; i < H; i++) {
+        let dx = x[i][0] - prev[0], dz = x[i][1] - prev[1]; prev = x[i];
+        dx += kj * (task.joy[0] * DT - dx); dz += kj * (task.joy[1] * DT - dz);
+        acc = [acc[0] + dx, acc[1] + dz]; x[i] = acc.slice();
+      }
+    }
+    if (trace) trace.push(x.map(p => p.slice()));
+  }
+  const out = priorClean(x, p0, v0, vmax, opts.momentum);
+  if (guide) { const g = costGrad(out, p0, task); for (let i = 0; i < H; i++) { out[i][0] -= 0.003 * g[i][0]; out[i][1] -= 0.003 * g[i][1]; } }
+  if (trace) trace.push(out.map(p => p.slice()));
+  return { plan: out, trace };
+}
+
+
+/* ================= math & camera ================= */
+const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const mul = (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const norm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x)), lerp = (a, b, t) => a + (b - a) * t;
+const bump = (x, c, w) => Math.abs(x - c) < w ? 0.5 * (1 + Math.cos(Math.PI * (x - c) / w)) : 0;
+const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d"), stageEl = document.getElementById("stage");
+let W = 0, Hh = 0, DPR = 1;
+function resize() { DPR = Math.min(2, window.devicePixelRatio || 1); W = stageEl.clientWidth; Hh = stageEl.clientHeight; cv.width = W * DPR; cv.height = Hh * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+window.addEventListener("resize", resize); resize();
+const cam = { tx: 0, ty: 0.6, tz: 0, dist: 4.4, az: 0.55, el: 0.22, fov: 0.72 };
+let camT = Object.assign({}, cam), userAz = 0, userEl = 0, view = null;
+function updateView() {
+  const ce = Math.cos(cam.el + userEl), se = Math.sin(cam.el + userEl), az = cam.az + userAz;
+  const C = [cam.tx + cam.dist * ce * Math.sin(az), cam.ty + cam.dist * se, cam.tz + cam.dist * ce * Math.cos(az)];
+  const f = norm(sub([cam.tx, cam.ty, cam.tz], C)), r = norm(cross(f, [0, 1, 0])), u = cross(r, f);
+  const narrow = W < 860;
+  view = { C, f, r, u, F: (Hh / 2) / Math.tan(cam.fov / 2), cx: narrow ? W / 2 : W * 0.44, cy: Hh * (narrow ? 0.5 : 0.44) };
+}
+function proj(P) { const d = sub(P, view.C), z = dot(d, view.f); return [view.cx + dot(d, view.r) * view.F / z, view.cy - dot(d, view.u) * view.F / z, z]; }
+function pickFloor(sx, sy) {
+  const dir = norm(add(add(view.f, mul(view.r, (sx - view.cx) / view.F)), mul(view.u, -(sy - view.cy) / view.F)));
+  if (dir[1] > -1e-3) return null; const t = -view.C[1] / dir[1]; return add(view.C, mul(dir, t));
+}
+/* ================= colours ================= */
+let COL = {};
+function readColours() {
+  const cs = getComputedStyle(document.documentElement);
+  ["bg", "floor", "grid", "ink", "muted", "panel", "line", "robot", "robot-far", "joint", "visor", "ghost", "past", "plan", "cost", "danger", "shadow", "shell", "shell-far", "frame", "frame-far", "glow", "tile", "sky", "danger-soft", "zero", "pos", "neg", "flow", "flow2", "accent", "soft", "band"].forEach(k => COL[k] = cs.getPropertyValue("--" + k).trim());
+}
+function rgba(hex, a) { const h = hex.replace("#", ""); const n = parseInt(h.length === 3 ? h.split("").map(c => c + c).join("") : h, 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; }
+function mix(h1, h2, t) { const a = parseInt(h1.slice(1), 16), b = parseInt(h2.slice(1), 16); const c = i => Math.round(lerp(a >> i & 255, b >> i & 255, t)); return `rgb(${c(16)},${c(8)},${c(0)})`; }
+/* ================= human-like motion clips ================= */
+const CLIPS = { walk: "Walk", run: "Run", dance: "Dance", kick: "Kick", jump: "Jump" };
+function idle(t) { const b = Math.sin(t * 1.6); return { hf: [0.02, 0.02], ha: [0.05, 0.05], kn: [0.08, 0.08], sf: [0.05, 0.05], sa: [0.12, 0.12], el: [0.25, 0.25], tp: 0.03 + 0.01 * b, tr: 0, ty: 0, sway: 0, fwd: 0, lift: 0 }; }
+function motion(clip, p, amp) {
+  amp = amp === undefined ? 1 : amp; const s = Math.sin, c = Math.cos, P = Math.PI;
+  if (clip === "walk" || clip === "run") {
+    const run = clip === "run", A = run ? 0.62 : 0.38, KN = run ? 1.15 : 0.62;
+    const kL = Math.pow(Math.max(0, c(p)), 1.3), kR = Math.pow(Math.max(0, c(p + P)), 1.3);
+    return { hf: [A * amp * s(p), A * amp * s(p + P)], ha: [0.04, 0.04], kn: [0.08 + KN * amp * kL + (run ? 0.2 : 0), 0.08 + KN * amp * kR + (run ? 0.2 : 0)],
+      sf: [(run ? 0.65 : 0.32) * amp * s(p + P), (run ? 0.65 : 0.32) * amp * s(p)], sa: [0.12, 0.12], el: [run ? 1.35 : 0.35, run ? 1.35 : 0.35],
+      tp: (run ? 0.17 : 0.05) * amp, tr: 0, ty: 0.1 * amp * s(p), sway: 0.015 * amp * s(p), fwd: 0, lift: run ? 0.035 * amp * Math.max(0, s(2 * p)) : 0 };
+  }
+  if (clip === "dance") {
+    const b = 0.5 - 0.5 * c(2 * p);
+    return { hf: [0.18 * s(p) + 0.1 * b, -0.18 * s(p) + 0.1 * b], ha: [0.12 + 0.12 * s(p), 0.12 - 0.12 * s(p)], kn: [0.2 + 0.35 * b, 0.2 + 0.35 * b],
+      sf: [0.6 * s(p + 1) + 0.3, 0.6 * s(p - 1) + 0.3], sa: [0.9 + 0.6 * s(p), 0.9 - 0.6 * s(p)], el: [0.9 + 0.6 * s(2 * p), 0.9 - 0.6 * s(2 * p)],
+      tp: 0.06, tr: 0.12 * s(p), ty: 0.45 * s(p), sway: 0.14 * s(p), fwd: 0, lift: 0 };
+  }
+  if (clip === "kick") {
+    const q = ((p % (2 * P)) + 2 * P) % (2 * P), ch = bump(q, 1.5, 0.7), k = bump(q, 2.2, 0.75), crouch = bump(q, 0.9, 0.6) * 0.6;
+    return { hf: [0.05 + 0.1 * crouch, 0.2 * ch + 1.55 * k], ha: [0.06, 0.06], kn: [0.15 + 0.35 * crouch, 1.5 * ch + 0.05 * k + 0.1],
+      sf: [0.2 + 0.7 * k, -0.4 * k], sa: [0.35 + 0.5 * k, 0.35 + 0.6 * k], el: [0.9, 0.5], tp: 0.04 - 0.3 * k, tr: 0, ty: 0.25 * k, sway: 0.05 * k, fwd: 0, lift: 0 };
+  }
+  if (clip === "jump") {
+    const q = ((p % (2 * P)) + 2 * P) % (2 * P), cr = bump(q, 1.0, 0.75) + bump(q, 3.6, 0.6), air = q > 1.6 && q < 3.2 ? s(P * (q - 1.6) / 1.6) : 0, tuck = bump(q, 2.4, 0.6);
+    return { hf: [0.85 * cr + 0.9 * tuck, 0.85 * cr + 0.9 * tuck], ha: [0.08, 0.08], kn: [1.3 * cr + 1.4 * tuck + 0.06, 1.3 * cr + 1.4 * tuck + 0.06],
+      sf: [-0.7 * cr + 2.5 * air, -0.7 * cr + 2.5 * air], sa: [0.25, 0.25], el: [0.3, 0.3], tp: 0.35 * cr + 0.2 * tuck, tr: 0, ty: 0, sway: 0, fwd: 0, lift: 0.42 * air };
+  }
+  return idle(p);
+}
+function blendPose(a, b, t) {
+  const o = {}; for (const k in a) o[k] = Array.isArray(a[k]) ? [lerp(a[k][0], b[k][0], t), lerp(a[k][1], b[k][1], t)] : lerp(a[k], b[k], t); return o;
+}
+/* ================= forward kinematics ================= */
+const B = { hipW: 0.09, thigh: 0.31, shin: 0.31, foot: 0.13, torso: 0.3, neck: 0.07, shW: 0.17, upper: 0.22, fore: 0.21 };
+function fk(A, root, yaw) {
+  const J = {}, s = Math.sin, c = Math.cos;
+  const P0 = [A.sway, B.thigh + B.shin + 0.06, A.fwd];
+  [[-1, 0, "L"], [1, 1, "R"]].forEach(([sg, i, n]) => {
+    const f = A.hf[i], a = A.ha[i], k = A.kn[i];
+    const hip = add(P0, [sg * B.hipW, 0, 0]);
+    const knee = add(hip, mul(norm([sg * s(a), -c(f) * c(a), s(f) * c(a)]), B.thigh));
+    const sf = f - k, ankle = add(knee, mul(norm([sg * s(a), -c(sf) * c(a), s(sf) * c(a)]), B.shin));
+    J["hip" + n] = hip; J["knee" + n] = knee; J["ankle" + n] = ankle; J["toe" + n] = add(ankle, [0, -0.035, B.foot]);
+  });
+  const td = norm([s(A.tr), c(A.tp) * c(A.tr), s(A.tp)]);
+  const chest = add(P0, mul(td, B.torso)), neck = add(chest, mul(td, B.neck)), head = add(neck, mul(td, 0.1));
+  J.pelvis = P0; J.chest = chest; J.neck = neck; J.head = head;
+  const upper = [];
+  [[-1, 0, "L"], [1, 1, "R"]].forEach(([sg, i, n]) => {
+    const f = A.sf[i], a = A.sa[i], e = A.el[i];
+    const sh = add(chest, [sg * B.shW, -0.03, 0]);
+    const ud = norm([sg * s(a), -c(a) * c(f), c(a) * s(f)]), elb = add(sh, mul(ud, B.upper));
+    const ff = f + e, fd = norm([sg * s(a) * 0.7, -c(a) * c(ff), c(a) * s(ff)]), hand = add(elb, mul(fd, B.fore));
+    J["sh" + n] = sh; J["el" + n] = elb; J["ha" + n] = hand; upper.push("sh" + n, "el" + n, "ha" + n);
+  });
+  upper.push("chest", "neck", "head");
+  const cy = c(A.ty), sy = s(A.ty);
+  upper.forEach(k => { const p = J[k], x = p[0] - P0[0], z = p[2] - P0[2]; J[k] = [P0[0] + x * cy + z * sy, p[1], P0[2] - x * sy + z * cy]; });
+  let minY = Infinity; ["ankleL", "ankleR", "toeL", "toeR"].forEach(k => minY = Math.min(minY, J[k][1]));
+  const lift = 0.025 - minY + A.lift, cyw = c(yaw), syw = s(yaw);
+  for (const k in J) { const p = J[k], x = p[0], z = p[2]; J[k] = [root[0] + x * cyw + z * syw, p[1] + lift, root[2] - x * syw + z * cyw]; }
+  return J;
+}
+/* ================= drawing ================= */
+function seg3(a, b, style, width, alpha) {
+  let pa = proj(a), pb = proj(b); const near = 0.2;
+  if (pa[2] < near && pb[2] < near) return;
+  if (pa[2] < near || pb[2] < near) { const t = (near - Math.min(pa[2], pb[2])) / Math.abs(pa[2] - pb[2]); const P = pa[2] < near ? add(a, mul(sub(b, a), t)) : add(b, mul(sub(a, b), t)); if (pa[2] < near) pa = proj(P); else pb = proj(P); }
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha; ctx.strokeStyle = style; ctx.lineWidth = width; ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke(); ctx.globalAlpha = 1;
+}
+function floorPoly(cx, cz, rx, rz, n) { const pts = []; for (let i = 0; i < n; i++) { const a = i / n * Math.PI * 2; const p = proj([cx + rx * Math.cos(a), 0.001, cz + rz * Math.sin(a)]); if (p[2] < 0.2) return null; pts.push(p); } return pts; }
+function fillPoly(pts, style, alpha) { if (!pts) return; ctx.globalAlpha = alpha === undefined ? 1 : alpha; ctx.fillStyle = style; ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1; }
+function strokePoly(pts, style, w, dash, alpha) { if (!pts) return; ctx.globalAlpha = alpha === undefined ? 1 : alpha; ctx.strokeStyle = style; ctx.lineWidth = w; ctx.setLineDash(dash || []); ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1; }
+let gridShift = [0, 0];
+function drawAxes() {
+  const o = [-2.6, 0.003, -2.6]; [[[0.32, 0.003, 0], "#E5484D"], [[0, 0.32, 0], "#30A46C"], [[0, 0.003, 0.32], "#3E7BFA"]].forEach(([e, c]) => seg3(o, add(o, e), c, 2.5, 0.85));
+}
+function drawFloor() {
+  const cx = cam.tx, cz = cam.tz, R = FLOOR_R;
+  const tile = 0.5, tx0 = Math.floor((cx - R) / tile), tz0 = Math.floor((cz - R) / tile), n = Math.ceil(2 * R / tile) + 1;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    const ix = tx0 + i, iz = tz0 + j; if ((ix + iz) & 1) continue;
+    const x0 = ix * tile - (gridShift[0] % (2 * tile)), z0 = iz * tile - (gridShift[1] % (2 * tile)), d = Math.hypot(x0 + tile / 2 - cx, z0 + tile / 2 - cz), a = clamp(1 - d / R, 0, 1);
+    if (a < 0.03) continue; const q = [[x0, 0, z0], [x0 + tile, 0, z0], [x0 + tile, 0, z0 + tile], [x0, 0, z0 + tile]].map(proj); if (q.some(p => p[2] < 0.2)) continue;
+    fillPoly(q, COL.tile, a * a);
+  }
+  const step = 0.5, ox = Math.floor((cx - R) / step) * step, oz = Math.floor((cz - R) / step) * step;
+  ctx.lineCap = "butt";
+  for (let i = 0; i <= 2 * R / step + 1; i++) {
+    for (let j = 0; j < 2 * R / step + 1; j++) {
+      const gx = ox + i * step - gridShift[0] % step, gz = oz + j * step - gridShift[1] % step;
+      const d1 = Math.hypot(gx - cx, gz + step / 2 - cz), a1 = clamp(1 - d1 / R, 0, 1);
+      if (a1 > 0.02) seg3([gx, 0, gz], [gx, 0, gz + step], COL.grid, 1, a1 * a1 * 0.9);
+      const gx2 = ox + j * step - gridShift[0] % step, gz2 = oz + i * step - gridShift[1] % step;
+      const d2 = Math.hypot(gx2 + step / 2 - cx, gz2 - cz), a2 = clamp(1 - d2 / R, 0, 1);
+      if (a2 > 0.02) seg3([gx2, 0, gz2], [gx2 + step, 0, gz2], COL.grid, 1, a2 * a2 * 0.9);
+    }
+  }
+}
+function drawShadow(J, alpha) {
+  const p = J.pelvis; fillPoly(floorPoly(p[0], p[2], 0.3, 0.22, 24), COL.shadow, 0.10 * alpha);
+  ["toeL", "toeR"].forEach(k => { const a = J[k.replace("toe", "ankle")]; const h = clamp(1 - a[1] / 0.4, 0, 1); fillPoly(floorPoly((a[0] + J[k][0]) / 2, (a[2] + J[k][2]) / 2, 0.09, 0.09, 14), COL.shadow, 0.16 * h * alpha); });
+}
+const BONES = [["chest", "neck", 0.05, "M"],
+  ["hipL", "kneeL", 0.078, "L"], ["kneeL", "ankleL", 0.062, "L"], ["ankleL", "toeL", 0.046, "L"], ["hipR", "kneeR", 0.078, "R"], ["kneeR", "ankleR", 0.062, "R"], ["ankleR", "toeR", 0.046, "R"],
+  ["shL", "elL", 0.056, "L"], ["elL", "haL", 0.048, "L"], ["shR", "elR", 0.056, "R"], ["elR", "haR", 0.048, "R"]];
+const JOINTDOTS = ["kneeL", "kneeR", "elL", "elR", "hipL", "hipR", "shL", "shR"];
+const MARKERS = ["head", "chest", "pelvis", "shL", "shR", "elL", "elR", "haL", "haR", "hipL", "hipR", "kneeL", "kneeR", "ankleL", "ankleR", "toeL", "toeR"];
+function drawRobot(J, style) {
+  const alpha = style.alpha === undefined ? 1 : style.alpha, bad = style.color === COL.danger;
+  const shell = bad ? COL["danger-soft"] : COL.shell, shellFar = bad ? COL["danger-soft"] : COL["shell-far"], frame = bad ? COL.danger : COL.frame, frameFar = COL["frame-far"];
+  const pz = proj(J.pelvis)[2], items = [];
+  const P = k => proj(J[k]);
+  const limb = (a, b, w, side, kind) => { const pa = P(a), pb = P(b); items.push({ t: "limb", pa, pb, w, side, kind, z: (pa[2] + pb[2]) / 2 }); };
+  [["L"], ["R"]].forEach(([n]) => { limb("hip" + n, "knee" + n, 0.082, n, "shell"); limb("knee" + n, "ankle" + n, 0.066, n, "shin"); limb("ankle" + n, "toe" + n, 0.05, n, "dark"); limb("sh" + n, "el" + n, 0.06, n, "shell"); limb("el" + n, "ha" + n, 0.05, n, "shell"); });
+  limb("chest", "neck", 0.05, "M", "dark");
+  const tq = ["shL", "shR", "hipR", "hipL"].map(k => proj(k.startsWith("hip") ? add(J[k], mul(sub(J.pelvis, J[k]), 0.3)) : add(J[k], mul(sub(J.chest, J[k]), 0.15))));
+  items.push({ t: "torso", pts: tq, z: (proj(J.chest)[2] + pz) / 2 + 0.001 });
+  items.push({ t: "pelvis", pa: P("hipL"), pb: P("hipR"), z: pz });
+  [["hipL", 0.052], ["hipR", 0.052], ["kneeL", 0.046], ["kneeR", 0.046], ["shL", 0.048], ["shR", 0.048], ["elL", 0.038], ["elR", 0.038], ["ankleL", 0.032], ["ankleR", 0.032], ["haL", 0.034], ["haR", 0.034]].forEach(([k, r]) => { const p = P(k); items.push({ t: "motor", p, r, z: p[2] - 0.004, side: k.slice(-1), hand: k.startsWith("ha") }); });
+  const hp = P("head"); items.push({ t: "head", p: hp, z: hp[2] - 0.01 });
+  items.sort((a, b) => b.z - a.z);
+  ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.globalAlpha = alpha;
+  const far = it => it.side && it.side !== "M" && it.z > pz + 0.02;
+  for (const it of items) {
+    if (it.z < 0.2) continue; const sc = view.F / it.z;
+    if (it.t === "limb") {
+      const w = Math.max(2, it.w * sc), f = far(it);
+      const seg = (a, b, col, lw) => { ctx.strokeStyle = col; ctx.lineWidth = lw; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); };
+      seg(it.pa, it.pb, f ? frameFar : frame, w + 2.4);
+      if (it.kind === "dark") continue;
+      if (it.kind === "shin") { const m = [lerp(it.pa[0], it.pb[0], 0.55), lerp(it.pa[1], it.pb[1], 0.55)]; seg(it.pa, m, f ? shellFar : shell, w); seg(m, it.pb, f ? frameFar : frame, w); }
+      else seg(it.pa, it.pb, f ? shellFar : shell, w);
+      if (!f) { ctx.globalAlpha = alpha * 0.55; const o = -w * 0.2; seg([it.pa[0] + o, it.pa[1] + o], [it.kind === "shin" ? lerp(it.pa[0], it.pb[0], 0.5) + o : it.pb[0] + o, it.kind === "shin" ? lerp(it.pa[1], it.pb[1], 0.5) + o : it.pb[1] + o], "#FFFFFF", w * 0.28); ctx.globalAlpha = alpha; }
+    } else if (it.t === "torso") {
+      ctx.fillStyle = shell; ctx.strokeStyle = frame; ctx.lineWidth = Math.max(2, 0.075 * sc) + 2.4;
+      ctx.beginPath(); it.pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.stroke();
+      ctx.strokeStyle = shell; ctx.lineWidth = Math.max(2, 0.075 * sc); ctx.stroke(); ctx.fill();
+      const c = proj(J.chest), pl = proj(J.pelvis); ctx.fillStyle = frame; ctx.globalAlpha = alpha * 0.85; ctx.beginPath(); ctx.ellipse(lerp(c[0], pl[0], 0.72), lerp(c[1], pl[1], 0.72), Math.abs(it.pts[1][0] - it.pts[0][0]) * 0.36 + 2, Math.max(2, 0.03 * sc), 0, 0, 7); ctx.fill();
+      ctx.globalAlpha = alpha * 0.9; ctx.fillStyle = COL.glow; ctx.beginPath(); ctx.arc(lerp(c[0], pl[0], 0.18), lerp(c[1], pl[1], 0.18), Math.max(1.4, 0.012 * sc), 0, 7); ctx.fill(); ctx.globalAlpha = alpha;
+    } else if (it.t === "pelvis") {
+      ctx.strokeStyle = frame; ctx.lineWidth = Math.max(3, 0.1 * sc); ctx.beginPath(); ctx.moveTo(it.pa[0], it.pa[1]); ctx.lineTo(it.pb[0], it.pb[1]); ctx.stroke();
+    } else if (it.t === "motor") {
+      const r = Math.max(1.6, it.r * sc), f = far(it); ctx.fillStyle = f ? frameFar : frame; ctx.beginPath(); ctx.arc(it.p[0], it.p[1], r, 0, 7); ctx.fill();
+      if (!it.hand) { ctx.strokeStyle = f ? frame : COL["frame-far"]; ctx.lineWidth = Math.max(1, r * 0.35); ctx.beginPath(); ctx.arc(it.p[0], it.p[1], r * 0.55, 0, 7); ctx.stroke(); }
+    } else if (it.t === "head") {
+      const r = Math.max(4, 0.1 * sc); ctx.fillStyle = frame; ctx.beginPath(); ctx.arc(it.p[0], it.p[1], r, 0, 7); ctx.fill();
+      const fd = facing(J), fp = proj(add(J.head, mul(fd, 0.1))), vis = dot(fd, mul(view.f, -1));
+      if (vis > -0.35) { const dx = (fp[0] - it.p[0]) * 0.6, dy = (fp[1] - it.p[1]) * 0.6, squash = clamp(0.35 + 0.65 * Math.abs(vis), 0.35, 1);
+        ctx.globalAlpha = alpha * clamp(vis + 0.55, 0, 1); ctx.strokeStyle = COL.glow; ctx.lineWidth = Math.max(1.4, r * 0.2);
+        ctx.beginPath(); ctx.ellipse(it.p[0] + dx, it.p[1] + dy - r * 0.05, r * 0.55 * squash, r * 0.55, 0, 0, 7); ctx.stroke();
+        ctx.globalAlpha = alpha * 0.35 * clamp(vis + 0.55, 0, 1); ctx.fillStyle = COL.glow; ctx.fill(); ctx.globalAlpha = alpha; }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+function drawFigure(J, style) {
+  if (style.kind === "robot") return drawRobot(J, style);
+  const kind = style.kind, alpha = style.alpha === undefined ? 1 : style.alpha, base = style.color || (kind === "ghost" ? COL.ghost : COL.robot);
+  const pz = proj(J.pelvis)[2];
+  const items = BONES.map(b => { const a = proj(J[b[0]]), c = proj(J[b[1]]); return { a, c, z: (a[2] + c[2]) / 2, w: b[2], side: b[3] }; });
+  const headP = proj(J.head); items.push({ head: true, a: headP, z: headP[2] });
+  const tq = ["shL", "shR", "hipR", "hipL"].map(k => proj(k.startsWith("hip") ? add(J[k], mul(sub(J.pelvis, J[k]), 0.35)) : add(J[k], mul(sub(J.chest, J[k]), 0.18)))); items.push({ torso: true, pts: tq, z: (proj(J.chest)[2] + proj(J.pelvis)[2]) / 2 });
+  items.sort((x, y) => y.z - x.z);
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const it of items) {
+    if (it.torso) {
+      if (style.thin) continue;
+      const sc = view.F / it.z; ctx.globalAlpha = (kind === "ghost" ? 0.34 : 1) * alpha; ctx.fillStyle = base; ctx.strokeStyle = base; ctx.lineWidth = Math.max(2, 0.07 * sc);
+      ctx.beginPath(); it.pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.closePath(); ctx.fill(); ctx.stroke();
+      if (kind !== "ghost") { const c = proj(J.chest); ctx.fillStyle = COL.joint; ctx.globalAlpha = 0.9 * alpha; ctx.beginPath(); ctx.arc(c[0], c[1] + 0.05 * sc, Math.max(1.5, 0.018 * sc), 0, 7); ctx.fill(); }
+      ctx.globalAlpha = 1; continue;
+    }
+    if (it.head) {
+      if (it.a[2] < 0.2) continue; const r = Math.max(1, 0.095 * view.F / it.a[2] * (style.thin ? 0.6 : 1));
+      ctx.globalAlpha = (kind === "ghost" ? 0.42 : 1) * alpha; ctx.fillStyle = base; ctx.beginPath(); ctx.arc(it.a[0], it.a[1], r, 0, 7); ctx.fill();
+      if (kind !== "ghost") { const fdir = sub(add(J.head, mul(facing(J), 0.08)), J.head), fp = proj(add(J.head, fdir));
+        const dx = fp[0] - it.a[0], dy = fp[1] - it.a[1]; const vis = dot(facing(J), mul(view.f, -1));
+        if (vis > -0.2) { ctx.fillStyle = COL.visor; ctx.globalAlpha = alpha * clamp(vis + 0.4, 0, 1); ctx.beginPath(); ctx.ellipse(it.a[0] + dx * 0.55, it.a[1] - r * 0.1, r * 0.62, r * 0.32, 0, 0, 7); ctx.fill(); } }
+      ctx.globalAlpha = 1; continue;
+    }
+    const far = it.side !== "M" && it.z > pz + 0.02;
+    let colr = base;
+    if (kind !== "ghost" && far) colr = style.far || COL["robot-far"];
+    ctx.globalAlpha = (kind === "ghost" ? (far ? 0.26 : 0.42) : 1) * alpha; ctx.strokeStyle = colr;
+    ctx.lineWidth = Math.max(1.5, it.w * view.F / it.z * (style.thin ? 0.4 : 1));
+    ctx.beginPath(); ctx.moveTo(it.a[0], it.a[1]); ctx.lineTo(it.c[0], it.c[1]); ctx.stroke(); ctx.globalAlpha = 1;
+  }
+  if (kind === "ghost" && style.markers !== false) {
+    MARKERS.forEach(k => { const p = proj(J[k]); const r = Math.max(2, 0.018 * view.F / p[2]); ctx.globalAlpha = 0.95 * alpha; ctx.fillStyle = "#FFFFFF"; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill(); ctx.strokeStyle = base; ctx.lineWidth = 1.2; ctx.stroke(); });
+  } else {
+    JOINTDOTS.forEach(k => { const p = proj(J[k]); const r = Math.max(1.5, 0.022 * view.F / p[2]); ctx.globalAlpha = alpha; ctx.fillStyle = COL.joint; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill(); });
+  }
+  ctx.globalAlpha = 1;
+}
+function facing(J) { const r = sub(J.hipR, J.hipL); return norm([-r[2], 0, r[0]]); }
+function ring(x, z, rad, colr, w, dash, alpha) { strokePoly(floorPoly(x, z, rad, rad, 40), colr, w, dash, alpha); }
+function dashed3(a, b, colr, w, alpha) { const pa = proj(a), pb = proj(b); ctx.globalAlpha = alpha; ctx.strokeStyle = colr; ctx.lineWidth = w; ctx.setLineDash([5, 5]); ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0], pb[1]); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1; }
+function dot3(P, rWorld, colr, alpha, minPx) { const p = proj(P); if (p[2] < 0.2) return; const r = Math.max(minPx || 2, rWorld * view.F / p[2]); ctx.globalAlpha = alpha; ctx.fillStyle = colr; ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 7); ctx.fill(); ctx.globalAlpha = 1; }
+function label3(P, text, colr, size, weight, alpha) { const p = proj(P); if (p[2] < 0.2) return; ctx.globalAlpha = alpha === undefined ? 1 : alpha; ctx.fillStyle = colr; ctx.font = `${weight || 600} ${size || 13}px "Instrument Sans", system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "top"; ctx.fillText(text, p[0], p[1]); ctx.globalAlpha = 1; }
+function drawFlag(g, alpha) {
+  ring(g[0], g[1], 0.22, COL.cost, 2.5, [], alpha); fillPoly(floorPoly(g[0], g[1], 0.22, 0.22, 32), COL.cost, 0.12 * alpha);
+  seg3([g[0], 0, g[1]], [g[0], 0.75, g[1]], COL.ink, 2.5, alpha);
+  const a = proj([g[0], 0.75, g[1]]), b = proj([g[0], 0.55, g[1]]), c2 = proj([g[0] + 0.28, 0.66, g[1]]);
+  ctx.globalAlpha = alpha; ctx.fillStyle = COL.cost; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(c2[0], c2[1]); ctx.lineTo(b[0], b[1]); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+}
+function drawCone(o, alpha, showField) {
+  if (showField) { [0.25, 0.45, 0.65].forEach((d, i) => ring(o.x, o.z, o.r + d, COL.cost, 1.4, [4, 5], (0.55 - i * 0.15) * alpha)); }
+  const base = floorPoly(o.x, o.z, o.r, o.r, 28); if (!base) return;
+  const apex = proj([o.x, 0.52, o.z]);
+  let lo = base[0], hi = base[0]; base.forEach(p => { if (p[0] < lo[0]) lo = p; if (p[0] > hi[0]) hi = p; });
+  ctx.globalAlpha = alpha; ctx.fillStyle = COL.cost; ctx.beginPath(); ctx.moveTo(apex[0], apex[1]); ctx.lineTo(lo[0], lo[1]);
+  base.filter(p => p[1] >= Math.min(lo[1], hi[1]) - 1).sort((a, b) => a[0] - b[0]).forEach(p => ctx.lineTo(p[0], p[1])); ctx.lineTo(hi[0], hi[1]); ctx.closePath(); ctx.fill();
+  const s1 = proj([o.x, 0.3, o.z]), s2 = proj([o.x, 0.22, o.z]), w1 = (hi[0] - lo[0]) * 0.5 * (1 - 0.3 / 0.52), w2 = (hi[0] - lo[0]) * 0.5 * (1 - 0.22 / 0.52);
+  ctx.fillStyle = "#FFFFFF"; ctx.globalAlpha = 0.9 * alpha; ctx.beginPath(); ctx.moveTo(s1[0] - w1, s1[1]); ctx.lineTo(s1[0] + w1, s1[1]); ctx.lineTo(s2[0] + w2, s2[1]); ctx.lineTo(s2[0] - w2, s2[1]); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+}
+function drawPlan(past, now, fut, alpha, opts) {
+  opts = opts || {};
+  ctx.lineCap = "round";
+  if (fut && fut.length) { ctx.globalAlpha = 0.35 * alpha; ctx.strokeStyle = COL.plan; ctx.lineWidth = 2; ctx.beginPath(); const p0 = proj([now[0], 0.01, now[1]]); ctx.moveTo(p0[0], p0[1]); fut.forEach(q => { const p = proj([q[0], 0.01, q[1]]); ctx.lineTo(p[0], p[1]); }); ctx.stroke(); ctx.globalAlpha = 1; }
+  (past || []).forEach((q, i) => dot3([q[0], 0.01, q[1]], 0.03, COL.past, 0.9 * alpha, 2.5));
+  ring(now[0], now[1], 0.06, COL.ink, 2, [], 0.8 * alpha);
+  (fut || []).forEach((q, i) => dot3([q[0], 0.01, q[1]], 0.03 - i * 0.0008, COL.plan, (opts.clarity === undefined ? 1 : opts.clarity) * (1 - i * 0.03) * alpha, 2.5));
+}
+/* ================= helpers ================= */
+let T = 0;
+const R = rng(20250808);
+const VW = 1600, VH = 900;
+function smoothPose(cur, target, dt, rate) { if (!cur) return JSON.parse(JSON.stringify(target)); return blendPose(cur, target, 1 - Math.exp(-rate * dt)); }
+function ease(x) { x = clamp(x, 0, 1); return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2; }
+function easeOutBack(x) { x = clamp(x, 0, 1); const c1 = 1.4, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); }
+function rodrigues(v, k, a) { const c = Math.cos(a), s = Math.sin(a); return add(add(mul(v, c), mul(cross(k, v), s)), mul(k, dot(k, v) * (1 - c))); }
+function rotateBody(J, pivot, axis, ang) { const o = {}; for (const k in J) o[k] = add(pivot, rodrigues(sub(J[k], pivot), axis, ang)); return o; }
+function lerpJ(A, Bj, t) { const o = {}; for (const k in A) o[k] = [lerp(A[k][0], Bj[k][0], t), lerp(A[k][1], Bj[k][1], t), lerp(A[k][2], Bj[k][2], t)]; return o; }
+function shiftJ(J, d) { const o = {}; for (const k in J) o[k] = add(J[k], d); return o; }
+const STAR = { hf: [0.05, 0.05], ha: [0.62, 0.62], kn: [0.05, 0.05], sf: [0.1, 0.1], sa: [2.75, 2.75], el: [0.05, 0.05], tp: 0, tr: 0, ty: 0, sway: 0, fwd: 0, lift: 0 };
+function cartwheelJ(u, origin, dir) { const base = fk(STAR, [0, 0, 0], 0), th = -2 * Math.PI * u, c = Math.cos(th), s = Math.sin(th), cy = base.pelvis[1] + 0.05, lat = 1.7 * u, out = {}; let minY = Infinity;
+  for (const k in base) { const p = base[k], x = p[0], y = p[1] - cy; out[k] = [x * c - y * s + lat, x * s + y * c + cy, p[2]]; minY = Math.min(minY, out[k][1]); }
+  const yaw = Math.atan2(-dir[1], dir[0]), cw = Math.cos(yaw), sw = Math.sin(yaw), W2 = {}; for (const k in out) { const p = out[k]; W2[k] = [origin[0] + p[0] * cw + p[2] * sw, p[1] - minY + 0.03, origin[1] - p[0] * sw + p[2] * cw]; } return W2; }
+const CODES = [0, 1, 2, 3, 4].map(i => { const r = rng(101 + i * 17); return Array.from({ length: 32 }, () => r() * 2 - 1); });
+const codeAt = (ci, ph) => CODES[ci].map((v, j) => clamp(v * 0.8 + 0.2 * Math.sin(ph * (0.5 + (j % 5) * 0.2) + j), -1, 1));
+function divc(v) { const t = clamp(Math.abs(v), 0, 1); return v >= 0 ? mix(COL.zero, COL.pos, t) : mix(COL.zero, COL.neg, t); }
+/* walker driven by the guided planner */
+function makeWalker(p, yaw) { return { p: p.slice(), v: [0, 0], yaw, phase: 0, pose: null, hist: [], acc: 0, plan: null, trail: [] }; }
+function walkStep(w, task, dt, opts) {
+  w.acc += dt; while (w.acc >= DT) { w.acc -= DT; const heading = task.goal ? [task.goal[0] - w.p[0], task.goal[1] - w.p[1]] : (task.joy && Math.hypot(...task.joy) > 0.05 ? task.joy : [Math.sin(w.yaw), Math.cos(w.yaw)]);
+    const res = planTrajectory(w.p, w.v, task, R, Object.assign({ heading }, opts || {})); w.plan = res.plan; const nv = [(w.plan[0][0] - w.p[0]) / DT, (w.plan[0][1] - w.p[1]) / DT];
+    w.v = [0.6 * w.v[0] + 0.4 * nv[0], 0.6 * w.v[1] + 0.4 * nv[1]]; const vs = Math.hypot(...w.v); if (vs > 1.2) w.v = w.v.map(x => x * 1.2 / vs); w.p = [w.p[0] + w.v[0] * DT, w.p[1] + w.v[1] * DT];
+    w.hist.push(w.p.slice()); if (w.hist.length > 5) w.hist.shift(); }
+  const sp = Math.hypot(...w.v), amp = clamp(sp / 0.8, 0, 1); w.phase += sp * dt / 0.78 * Math.PI * 2;
+  w.pose = smoothPose(w.pose, amp < 0.12 ? idle(T) : blendPose(idle(T), motion("walk", w.phase, amp), clamp(amp * 1.6, 0, 1)), dt, 14);
+  if (sp > 0.08) { let d = Math.atan2(w.v[0], w.v[1]) - w.yaw; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; w.yaw += d * (1 - Math.exp(-8 * dt)); }
+  w.J = fk(w.pose, [w.p[0], 0, w.p[1]], w.yaw);
+  if (!w.lt || Math.hypot(w.p[0] - w.lt[0], w.p[1] - w.lt[1]) > 0.14) { w.trail.push(w.p.slice()); w.lt = w.p.slice(); if (w.trail.length > 40) w.trail.shift(); }
+}
+/* ================= drawing primitives in virtual space ================= */
+let FLOOR_R = 6, LITE = false;
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath(); }
+function tx(s, x, y, size, color, weight, align, alpha, base) { ctx.globalAlpha = alpha === undefined ? 1 : alpha; ctx.fillStyle = color; ctx.font = `${weight || 400} ${size}px "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif`; ctx.textAlign = align || "left"; ctx.textBaseline = base || "alphabetic"; ctx.fillText(s, x, y); ctx.globalAlpha = 1; }
+function pill(s, x, y, size, col, align) { ctx.font = `700 ${size}px "Instrument Sans", system-ui, sans-serif`; const w = ctx.measureText(s).width + size * 1.2, h = size * 1.9, x0 = align === "right" ? x - w : align === "center" ? x - w / 2 : x;
+  ctx.fillStyle = COL.panel; ctx.globalAlpha = 0.94; rr(x0, y, w, h, h / 2); ctx.fill(); ctx.globalAlpha = 1; ctx.strokeStyle = col; ctx.lineWidth = Math.max(1.5, size / 9); ctx.stroke(); tx(s, x0 + w / 2, y + h * 0.66, size, col, 700, "center"); }
+function scene(r, c, draw, opts) {
+  opts = opts || {}; ctx.save(); rr(r.x, r.y, r.w, r.h, opts.radius === undefined ? 10 : opts.radius); ctx.clip(); ctx.translate(r.x, r.y);
+  W = r.w; Hh = r.h; Object.assign(cam, c); updateView(); view.cx = W / 2 + (c.ox || 0) * W; view.cy = Hh * (c.cy || 0.55);
+  ctx.fillStyle = COL.sky; ctx.fillRect(0, 0, W, Hh); if (opts.floor !== false && !(LITE && r.w < 480)) { FLOOR_R = LITE ? Math.min(opts.R || 5, 3.5) : (opts.R || 5); drawFloor(); }
+  draw(); ctx.restore();
+}
+function bars(x, y, w, h, vals, opts) { opts = opts || {}; const n = vals.length, bw = w / n, mid = y + h / 2; vals.forEach((v, i) => { const hh = (h / 2) * clamp(v, -1, 1); ctx.fillStyle = opts.col || (v >= 0 ? COL.pos : COL.neg); ctx.fillRect(x + i * bw + bw * 0.12, hh >= 0 ? mid - hh : mid, bw * 0.76, Math.abs(hh)); }); if (opts.axis !== false) { ctx.strokeStyle = COL.line; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, mid); ctx.lineTo(x + w, mid); ctx.stroke(); } }
+function trap(x, y, w, h, narrowRight, col, label, size) { const k = h * 0.32; ctx.fillStyle = rgba(col, 0.2); ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath();
+  if (narrowRight) { ctx.moveTo(x, y); ctx.lineTo(x + w, y + k); ctx.lineTo(x + w, y + h - k); ctx.lineTo(x, y + h); } else { ctx.moveTo(x, y + k); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + h); ctx.lineTo(x, y + h - k); } ctx.closePath(); ctx.fill(); ctx.stroke();
+  if (label) tx(label, x + w / 2, y + h / 2 + size * 0.35, size, COL.ink, 700, "center"); }
+function arrowH(x1, y, x2, col, w) { ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = w || 3; ctx.beginPath(); ctx.moveTo(x1, y); ctx.lineTo(x2 - 8, y); ctx.stroke(); ctx.beginPath(); ctx.moveTo(x2, y); ctx.lineTo(x2 - 12, y - 7); ctx.lineTo(x2 - 12, y + 7); ctx.closePath(); ctx.fill(); }
+function flowDots(x1, y1, x2, y2, n, col, size, speed) { for (let i = 0; i < n; i++) { const u = ((T * (speed || 0.6) + i / n) % 1); ctx.globalAlpha = Math.sin(u * Math.PI); ctx.fillStyle = col; ctx.beginPath(); ctx.arc(lerp(x1, x2, u), lerp(y1, y2, u), size, 0, 7); ctx.fill(); } ctx.globalAlpha = 1; }
+/* ================= the nine steps ================= */
+function toJoints(A) { const q = []; [0, 1].forEach(i => { const sg = i ? -1 : 1; q.push(-A.hf[i], sg * A.ha[i], 0.05 * A.ty, A.kn[i], -(A.hf[i] - A.kn[i]) * 0.55, -sg * A.ha[i] * 0.6); }); q.push(A.ty, A.tr, A.tp); [0, 1].forEach(i => { const sg = i ? -1 : 1; q.push(-A.sf[i], sg * A.sa[i], 0.1 * sg * A.ty, A.el[i], 0, 0, 0); }); return q; }
+const Q0 = toJoints(idle(0));
+function arrow3(a, b, col, w) { const pa = proj(a), pb = proj(b), L = Math.hypot(pb[0] - pa[0], pb[1] - pa[1]); if (L < 4) return; ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = w; ctx.lineCap = "round"; const an = Math.atan2(pb[1] - pa[1], pb[0] - pa[0]), hs = Math.min(12, L * 0.4);
+  ctx.beginPath(); ctx.moveTo(pa[0], pa[1]); ctx.lineTo(pb[0] - Math.cos(an) * hs * 0.6, pb[1] - Math.sin(an) * hs * 0.6); ctx.stroke(); ctx.beginPath(); ctx.moveTo(pb[0], pb[1]); ctx.lineTo(pb[0] - Math.cos(an - 0.45) * hs, pb[1] - Math.sin(an - 0.45) * hs); ctx.lineTo(pb[0] - Math.cos(an + 0.45) * hs, pb[1] - Math.sin(an + 0.45) * hs); ctx.closePath(); ctx.fill(); }
+function wobble(A, amt, seed) { const o = JSON.parse(JSON.stringify(A)), s = Math.sin, t = T * 2.3 + seed; o.sa = [o.sa[0] + amt * (0.9 + 0.6 * s(t)), o.sa[1] + amt * (0.7 + 0.6 * s(t * 1.3 + 1))]; o.sf = [o.sf[0] + amt * 0.8 * s(t * 0.9), o.sf[1] - amt * 0.8 * s(t * 1.1 + 2)]; o.hf = [o.hf[0] + amt * 0.4 * s(t * 1.4), o.hf[1] - amt * 0.35 * s(t * 1.2 + 1)]; o.kn = [o.kn[0] + amt * 0.5 * Math.abs(s(t)), o.kn[1] + amt * 0.4 * Math.abs(s(t + 1))]; o.tr = (o.tr || 0) + amt * 0.25 * s(t * 0.8); o.tp = o.tp + amt * 0.2; return o; }
+const KEYS = ["haL", "haR", "toeL", "toeR", "head"];
+const STEPS = [
+ { id: "lafan", n: 1, title: "Human motion data (LAFAN1)", cap: "Real human motion capture, about 2.5 hours, reshaped to fit the robot’s body.", slot: { x: 110, y: 112, w: 440, h: 220 }, ph: [0, 1, 2, 3, 4, 5],
+   clips: [["walk", "Walk", 5.2], ["run", "Run", 8.0], ["dance", "Dance", 2.6], ["kick", "Kick", 2.6], ["jump", "Jump", 2.2], ["dance", "Dance 2", 3.4]],
+   update(dt) { this.clips.forEach((c, i) => this.ph[i] += dt * c[2]); },
+   draw(r, big) {
+     const cols = big ? 3 : 6, rows = big ? 2 : 1, gap = big ? 16 : 6, cw = (r.w - gap * (cols - 1)) / cols, ch = (r.h - gap * (rows - 1)) / rows;
+     this.clips.forEach(([clip, name], i) => { const c = { x: r.x + (i % cols) * (cw + gap), y: r.y + Math.floor(i / cols) * (ch + gap), w: cw, h: ch };
+       const J = fk(motion(clip, this.ph[i], clip === "walk" || clip === "run" ? 0.85 : 1), [0, 0, 0], 0.5 + i * 0.4);
+       scene(c, { tx: 0, ty: 0.68, tz: 0, dist: big ? 2.7 : 3.2, az: 0.2, el: 0.1, cy: big ? 0.47 : 0.5 }, () => { drawShadow(J, 0.6); drawFigure(J, { kind: "ghost", markers: big }); }, { floor: false, radius: big ? 12 : 6 });
+       tx(name, c.x + (big ? 14 : c.w / 2), c.y + c.h - (big ? 14 : 5), big ? 18 : 10.5, COL.ink, 700, big ? "left" : "center"); });
+   } },
+ { id: "track", n: 2, title: "Track the motion from the torso", cap: "The error is measured from the robot’s own torso, so drifting in the room doesn’t ruin the move.", slot: { x: 580, y: 112, w: 440, h: 220 }, ph: 0,
+   update(dt) { this.ph += dt * 2.2; },
+   draw(r, big, tl) {
+     const cyc = big ? tl % 6.5 : (T * 0.9) % 6.5, attach = ease((cyc - 1.5) / 1.2), fix = ease((cyc - 2.8) / 1.5);
+     const refA = motion("dance", this.ph), robA = blendPose(wobble(refA, 0.55, 3), refA, fix), robJ = fk(robA, [0, 0, 0], 0.3), gRoot = [lerp(-0.62, 0, attach), 0, lerp(0.12, 0, attach)], gJ = fk(refA, gRoot, 0.3);
+     scene(r, { tx: -0.25, ty: 0.72, tz: 0, dist: big ? 3.0 : 2.9, az: 0.32, el: 0.12, cy: 0.5 }, () => {
+       drawShadow(robJ, 1); drawShadow(gJ, 0.5); ring(robJ.pelvis[0], robJ.pelvis[2], 0.2, COL.accent, big ? 3 : 2, [], 0.9);
+       drawFigure(robJ, { kind: "robot" }); drawFigure(gJ, { kind: "ghost", alpha: 0.9 });
+       const errCol = attach < 0.5 ? COL.danger : COL.cost; let tot = 0; KEYS.forEach(k => { const a = robJ[k], b = gJ[k]; tot += Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); if (Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) > 0.035) arrow3(a, b, errCol, big ? 3.2 : 2); });
+       if (big) { const p = proj(add(robJ.chest, [0.0, 0, 0])); ctx.strokeStyle = COL.accent; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(p[0], p[1], 18, 0, 7); ctx.stroke(); tx("anchor (torso)", p[0] + 26, p[1] - 22, 17, COL.accent, 700);
+         const lab = cyc < 1.5 ? ["Error measured in the room: large", COL.danger] : cyc < 2.8 ? ["Re-attach the clip to the robot’s torso", COL.cost] : cyc < 4.4 ? ["Now only the pose error is left", COL.accent] : ["Tracked", COL.accent];
+         pill(lab[0], 22, 18, 20, lab[1]); tx("tracking error", W - 250, Hh - 40, 16, COL.muted, 600); ctx.fillStyle = COL.zero; rr(W - 250, Hh - 30, 220, 12, 6); ctx.fill(); ctx.fillStyle = errCol; rr(W - 250, Hh - 30, Math.max(6, 220 * clamp(tot / 2.6, 0, 1)), 12, 6); ctx.fill();
+         tx("pink: human clip", 22, Hh - 46, 16, COL.ghost, 700); tx("silver: robot", 22, Hh - 22, 16, COL.muted, 700); }
+     }, { R: big ? 6 : 3 });
+   } },
+ { id: "experts", n: 3, title: "One expert per move", cap: "A small policy learns each motion in simulation, all with the same recipe.", slot: { x: 1050, y: 112, w: 440, h: 220 }, ph: [0, 0, 0],
+   ex: [["walk", "Walk", 5.2], ["dance", "Dance", 2.6], ["kick", "Kick", 2.6]],
+   update(dt) { this.ex.forEach((e, i) => this.ph[i] += dt * e[2]); },
+   draw(r, big, tl) {
+     const gap = big ? 18 : 8, cw = (r.w - gap * 2) / 3, chartH = big ? 120 : 10;
+     this.ex.forEach(([clip, name], i) => { const c = { x: r.x + i * (cw + gap), y: r.y, w: cw, h: r.h - chartH - (big ? 14 : 4) };
+       const prog = big ? ease(clamp((tl % 7.5 - 0.3 - i * 0.45) / 3.4, 0, 1)) : clamp(((T * 0.11 + i * 0.27) % 1.25), 0, 1);
+       const refA = motion(clip, this.ph[i], clip === "walk" ? 0.85 : 1); let J = fk(blendPose(wobble(refA, 0.9, i * 2), refA, prog), [0, 0, 0], 0.4), gJ = fk(refA, [0, 0, 0], 0.4);
+       const lean = Math.pow(1 - prog, 1.6) * 0.62 * (0.55 + 0.45 * Math.sin(T * 1.6 + i)); if (lean > 0.02) { const piv = [(J.toeL[0] + J.toeR[0]) / 2, 0, (J.toeL[2] + J.toeR[2]) / 2]; J = rotateBody(J, piv, [0, 0, 1], (i % 2 ? -1 : 1) * lean); }
+       scene(c, { tx: 0, ty: 0.62, tz: 0, dist: big ? 2.8 : 3.0, az: 0.3, el: 0.12, cy: 0.5 }, () => { drawShadow(J, 1); drawFigure(gJ, { kind: "ghost", alpha: 0.35, markers: false }); drawFigure(J, { kind: "robot" }); }, { R: big ? 4 : 2.5, radius: big ? 12 : 6 });
+       tx(name + " expert", c.x + c.w / 2, c.y + (big ? 30 : 13), big ? 18 : 10.5, COL.ink, 700, "center");
+       const by = c.y + c.h + (big ? 14 : 3);
+       if (big) { ctx.fillStyle = COL.soft; rr(c.x, by, cw, chartH, 10); ctx.fill(); ctx.strokeStyle = COL.accent; ctx.lineWidth = 3; ctx.beginPath(); const n = 60;
+         for (let k = 0; k <= n * prog; k++) { const x = k / n, y = (1 - Math.exp(-4 * x)) * 0.9 + 0.05 * Math.sin(k * 1.7 + i); const px = c.x + 12 + (cw - 24) * x, py = by + chartH - 14 - (chartH - 36) * y; k ? ctx.lineTo(px, py) : ctx.moveTo(px, py); } ctx.stroke();
+         tx("reward", c.x + 12, by + 22, 15, COL.muted, 700); tx(Math.round(prog * 30000).toLocaleString() + " iterations", c.x + cw - 12, by + 22, 15, COL.muted, 600, "right"); }
+       else { ctx.fillStyle = COL.zero; rr(c.x, by, cw, 6, 3); ctx.fill(); ctx.fillStyle = COL.accent; rr(c.x, by, cw * prog, 6, 3); ctx.fill(); } });
+   } },
+ { id: "dagger", n: 4, title: "One student learns all experts", cap: "DAgger: the student drives, and the expert shows what it should have done.", slot: { x: 110, y: 372, w: 440, h: 220 }, ph: 0,
+   update(dt) { this.ph += dt * 2.6; },
+   draw(r, big, tl) {
+     const e = big ? 1 - ease((tl % 7) / 4.5) : 0.55 + 0.45 * Math.cos(T * 0.6), refA = motion("dance", this.ph), sJ = fk(blendPose(refA, wobble(refA, 0.8, 5), e * 0.9), [0, 0, 0], 0.3), xJ = fk(refA, [0, 0, 0], 0.3);
+     const sr = big ? { x: r.x, y: r.y, w: r.w * 0.55, h: r.h } : { x: r.x, y: r.y, w: r.w * 0.62, h: r.h };
+     scene(sr, { tx: 0, ty: 0.7, tz: 0, dist: big ? 2.9 : 2.9, az: 0.32, el: 0.12, cy: 0.5 }, () => { drawShadow(sJ, 1); drawFigure(sJ, { kind: "robot" }); drawFigure(xJ, { kind: "ghost", color: COL.accent, alpha: 0.85, markers: false });
+       KEYS.forEach(k => { const a = sJ[k], b = xJ[k]; if (Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]) > 0.04) arrow3(a, b, COL.cost, big ? 3 : 2); });
+       if (big) { tx("silver: student", 20, Hh - 46, 17, COL.muted, 700); tx("teal: what the expert would do", 20, Hh - 22, 17, COL.accent, 700); } }, { R: big ? 5 : 3 });
+     const rx = sr.x + sr.w + (big ? 30 : 12), rw = r.x + r.w - rx;
+     if (big) { const cx = rx + rw / 2, cy = r.y + 190, rad = 120, nodes = [["student acts", COL.muted], ["expert labels", COL.accent], ["student learns", COL.past]], act = Math.floor(T * 0.9) % 3;
+       ctx.strokeStyle = COL.line; ctx.lineWidth = 3; ctx.setLineDash([6, 8]); ctx.beginPath(); ctx.arc(cx, cy, rad, 0, 7); ctx.stroke(); ctx.setLineDash([]);
+       const a0 = T * 0.9 * 2 * Math.PI / 3 - Math.PI / 2; ctx.fillStyle = COL.cost; ctx.beginPath(); ctx.arc(cx + Math.cos(a0) * rad, cy + Math.sin(a0) * rad, 8, 0, 7); ctx.fill();
+       nodes.forEach(([n, col], i) => { const a = -Math.PI / 2 + i * 2 * Math.PI / 3, x = cx + Math.cos(a) * rad, y = cy + Math.sin(a) * rad; pill(n, x, y - 18, i === act ? 19 : 17, i === act ? col : COL.line, "center"); });
+       tx("DAgger loop", cx, cy + 8, 22, COL.ink, 700, "center");
+       const by = r.y + 360, bh = r.h - 380; tx("action mismatch", rx, by, 18, COL.ink, 700); const n = 12; for (let i = 0; i < n; i++) { const v = Math.exp(-i / 3.2) * 0.95 + 0.05, x = rx + i * rw / n, done = (1 - e) * n > i; ctx.fillStyle = done ? COL.cost : COL.zero; const hh = (bh - 30) * v; ctx.fillRect(x + 4, by + 14 + (bh - 30) - hh, rw / n - 8, hh); } tx("iterations →", rx + rw, by + bh + 4, 15, COL.muted, 600, "right"); }
+     else { tx("mismatch", rx, r.y + 20, 11, COL.muted, 700); ctx.fillStyle = COL.zero; rr(rx, r.y + 30, rw, 10, 5); ctx.fill(); ctx.fillStyle = COL.cost; rr(rx, r.y + 30, rw * e, 10, 5); ctx.fill(); tx("student", rx, r.y + 70, 11, COL.muted, 700); tx("expert", rx, r.y + 88, 11, COL.accent, 700); }
+   } },
+ { id: "vae", n: 5, title: "Squeeze moves into 32 numbers", cap: "The student is a VAE: each moment of a move becomes a 32-number code, and is decoded back.", slot: { x: 580, y: 372, w: 440, h: 220 }, ph: 0, code: null,
+   update(dt) { this.ph += dt * 2.8; const mi = Math.floor(T / 3) % 3, tgt = codeAt([0, 2, 3][mi], this.ph); this.code = this.code ? this.code.map((v, j) => lerp(v, tgt[j], 1 - Math.exp(-dt * 6))) : tgt; this.mi = mi; },
+   draw(r, big) {
+     const clip = ["walk", "dance", "kick"][this.mi], A = motion(clip, this.ph, clip === "walk" ? 0.85 : 1), J = fk(A, [0, 0, 0], 0.4);
+     if (big) { const sw = r.w * 0.22, sh = r.h * 0.78, sy = r.y + (r.h - sh) / 2;
+       scene({ x: r.x, y: sy, w: sw, h: sh }, { tx: 0, ty: 0.66, tz: 0, dist: 2.7, az: 0.3, el: 0.12, cy: 0.5 }, () => { drawShadow(J, 1); drawFigure(J, { kind: "ghost", markers: false }); }, { R: 3, radius: 12 });
+       scene({ x: r.x + r.w - sw, y: sy, w: sw, h: sh }, { tx: 0, ty: 0.66, tz: 0, dist: 2.7, az: 0.3, el: 0.12, cy: 0.5 }, () => { drawShadow(J, 1); drawFigure(J, { kind: "robot" }); }, { R: 3, radius: 12 });
+       tx("a moment of " + clip, r.x + sw / 2, sy - 12, 18, COL.ghost, 700, "center"); tx("joint targets", r.x + r.w - sw / 2, sy - 12, 18, COL.ink, 700, "center");
+       const ex = r.x + sw + 40, ew = r.w * 0.14, my = r.y + r.h / 2; trap(ex, my - 130, ew, 260, true, COL.past, "encoder", 19);
+       const cx0 = ex + ew + 40, cw0 = r.w - 2 * sw - 2 * ew - 160; ctx.fillStyle = COL.soft; rr(cx0 - 10, my - 110, cw0 + 20, 220, 14); ctx.fill(); bars(cx0, my - 90, cw0, 180, this.code); tx("z: 32 numbers", cx0 + cw0 / 2, my + 140, 20, COL.ink, 700, "center");
+       trap(cx0 + cw0 + 40, my - 130, ew, 260, false, COL.accent, "decoder", 19);
+       flowDots(r.x + sw + 6, my, ex - 4, my, 4, COL.ghost, 5); flowDots(ex + ew + 4, my, cx0 - 12, my, 3, COL.past, 5); flowDots(cx0 + cw0 + 12, my, cx0 + cw0 + 36, my, 2, COL.accent, 5); flowDots(cx0 + cw0 + 44 + ew, my, r.x + r.w - sw - 6, my, 4, COL.accent, 5); }
+     else { const my = r.y + r.h / 2, ew = r.w * 0.2; trap(r.x, my - 50, ew, 100, true, COL.past, "enc", 13); const cx0 = r.x + ew + 20, cw0 = r.w - 2 * ew - 40; bars(cx0, my - 44, cw0, 88, this.code); trap(r.x + r.w - ew, my - 50, ew, 100, false, COL.accent, "dec", 13); tx("z (32)", cx0 + cw0 / 2, r.y + r.h - 2, 11, COL.muted, 700, "center"); }
+   } },
+ { id: "diff", n: 6, onOpen() { this.trT = -9; }, title: "Imagine the next 0.64 seconds", cap: "Latent diffusion: starting from noise, the model cleans up a short future in 20 steps.", slot: { x: 1050, y: 372, w: 440, h: 220 }, w: null, tr: null, trT: -9,
+   update(dt) { if (!this.w) { this.w = makeWalker([0, 0], 0); } const w = this.w; walkStep(w, { goal: [w.p[0] + 0.6 * Math.sin(T * 0.3), w.p[1] + 3], obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, dt);
+     if (T - this.trT > 3.4) { this.trT = T; const res = planTrajectory(w.p, w.v, { goal: [w.p[0] + 0.6 * Math.sin((T + 0.5) * 0.3), w.p[1] + 3], obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, R, { trace: true, heading: [0, 1] }); this.tr = res.trace.map(fr => fr.map(q => [q[0] - w.p[0], q[1] - w.p[1]])); }
+     this.k = Math.min(20, Math.floor(clamp((T - this.trT) / 2.4, 0, 1) * 21)); },
+   tokens(x, y, w, h, big) { const n = 21, cw = w / n, rh = h / 2, nzF = 1 - this.k / 20;
+     for (let r2 = 0; r2 < 2; r2++) for (let i = 0; i < n; i++) { const fut = i > 4, nz = fut ? nzF : 0, k = r2 ? 12 : 6, sh = (rh - 6) / k;
+       for (let j = 0; j < k; j++) { const clean = r2 ? codeAt(0, this.w.phase + i * 0.25)[j * 2] : Math.sin(this.w.phase + i * 0.45 + j * 1.3) * 0.85; ctx.fillStyle = divc(clean * (1 - nz) + nz * Math.sin(T * 31 + i * 7.3 + j * 3.1 + r2 * 11) * 1.2); ctx.fillRect(x + i * cw + 1, y + r2 * rh + 2 + j * sh, cw - 3, Math.max(0.6, sh - 0.4)); } }
+     ctx.strokeStyle = COL.ink; ctx.lineWidth = 2; ctx.strokeRect(x + 4 * cw, y, cw - 1, h); if (big) { tx("past", x + 2 * cw, y + h + 24, 17, COL.muted, 700, "center"); tx("now", x + 4.5 * cw, y + h + 24, 17, COL.ink, 700, "center"); tx("future: 16 steps = 0.64 s", x + 13 * cw, y + h + 24, 17, COL.muted, 700, "center"); tx("body", x - 10, y + rh / 2 + 6, 16, COL.past, 700, "right"); tx("code", x - 10, y + rh * 1.5 + 6, 16, COL.accent, 700, "right"); } },
+   draw(r, big) {
+     if (big) { this.tokens(r.x + 60, r.y + 10, r.w - 70, 170, true); pill("denoising step " + this.k + " / 20", r.x + r.w, r.y + 214, 18, this.k < 20 ? COL.cost : COL.accent, "right");
+       const sr = { x: r.x, y: r.y + 262, w: r.w, h: r.h - 262 }, w = this.w;
+       scene(sr, { tx: w.p[0], ty: 0.25, tz: w.p[1] + 0.5, dist: 4.4, az: 1.9, el: 0.62, cy: 0.55 }, () => { w.trail.forEach((q, i) => dot3([q[0], 0.004, q[1]], 0.02, COL.muted, 0.5 * (i + 1) / w.trail.length, 2)); drawShadow(w.J, 1); drawFigure(w.J, { kind: "robot" });
+         if (this.tr) { const fr = this.tr[Math.min(this.k + 1, this.tr.length - 1)], cl = this.k / 20; fr.forEach((q, i) => dot3([q[0] + w.p[0], 0.01, q[1] + w.p[1]], 0.045 - i * 0.0013, mix(COL.cost, COL.plan, cl), 0.95, 3)); } }, { R: 5, radius: 12 }); }
+     else { this.tokens(r.x, r.y + 4, r.w, r.h - 26, false); tx("step " + this.k + " / 20", r.x + r.w, r.y + r.h - 4, 12, this.k < 20 ? COL.cost : COL.accent, 700, "right"); tx("noise → plan", r.x, r.y + r.h - 4, 12, COL.muted, 700); }
+   } },
+ { id: "guide", n: 7, title: "Nudge it toward a new task", cap: "Guidance: add a small push at every denoising step. Same model, no retraining.", slot: { x: 110, y: 632, w: 440, h: 220 }, cone: { x: 0.05, z: 0, r: 0.18 }, goal: [0, 1.6], A: null, B: null,
+   onOpen() { this.reset(); },
+   reset() { this.A = makeWalker([0, -1.6], 0); this.A.v = [0, 0.85]; this.B = makeWalker([0, -1.6], 0); this.B.v = [0, 0.85]; this.hold = 0; this.hitA = 0; this.everHit = false; this.doneB = false; },
+   update(dt) { if (!this.A) this.reset();
+     if (this.A.p[1] < 1.6) walkStep(this.A, { joy: [0, 0.85], wJoy: 0.25, obstacles: [], body: 0.3 }, dt); else walkStep(this.A, { joy: [0, 0], wJoy: 0.25, obstacles: [], body: 0.3 }, dt);
+     walkStep(this.B, { goal: this.goal, obstacles: [this.cone], body: 0.3, wObs: 1.2, wSlow: 0.06, reach: 0.6 }, dt);
+     const dA = Math.hypot(this.A.p[0] - this.cone.x, this.A.p[1] - this.cone.z); if (dA < 0.36) { this.hitA = 1; this.everHit = true; } else this.hitA = Math.max(0, this.hitA - dt * 1.2);
+     if (Math.hypot(this.B.p[0] - this.goal[0], this.B.p[1] - this.goal[1]) < 0.24) this.doneB = true; if (this.doneB && this.A.p[1] > 1.3) { this.hold += dt; if (this.hold > 1.6) this.reset(); } },
+   panel(c, w, nudged, big) {
+     const task = { goal: this.goal, obstacles: [this.cone], body: 0.3, wObs: 1.2, wSlow: 0.06, reach: 0.6 }, grad = nudged && w.plan ? costGrad(w.plan, w.p, task) : null, J = w.J || fk(idle(0), [w.p[0], 0, w.p[1]], w.yaw);
+     scene(c, { tx: 0, ty: 0, tz: 0, dist: big ? 6.0 : 6.2, az: 0.22, el: 1.08, cy: 0.5 }, () => {
+       w.trail.forEach((q, k) => dot3([q[0], 0.004, q[1]], 0.026, nudged ? COL.accent : COL.muted, 0.6 * (k + 1) / w.trail.length, 2)); drawFlag(this.goal, 1); drawShadow(J, 1); drawCone(this.cone, 1, nudged);
+       if (!nudged && this.hitA > 0) ring(this.cone.x, this.cone.z, 0.5, COL.danger, big ? 5 : 3, [], this.hitA);
+       drawFigure(J, { kind: "robot" });
+       if (w.plan) w.plan.forEach((q, k) => { dot3([q[0], 0.01, q[1]], 0.034, COL.plan, 0.9, 2.2); if (grad) { const g = grad[k], L = Math.hypot(g[0], g[1]); if (L > 1e-3) { const s = Math.min(0.4, L * 0.07) / L; arrow3([q[0], 0.01, q[1]], [q[0] - g[0] * s, 0.01, q[1] - g[1] * s], COL.cost, big ? 2.6 : 1.6); } } });
+     }, { R: big ? 4.5 : 3.5, radius: big ? 14 : 8 });
+     pill(nudged ? (big ? "With a nudge at every denoising step" : "with nudge") : (big ? "No nudge" : "no nudge"), c.x + (big ? 14 : 6), c.y + (big ? 12 : 5), big ? 19 : 11, nudged ? COL.cost : COL.muted);
+     if (big) { if (!nudged && this.everHit) pill("walks straight into the cone", c.x + c.w - 14, c.y + c.h - 52, 19, COL.danger, "right"); if (nudged && this.doneB) pill("reaches the flag", c.x + c.w - 14, c.y + c.h - 52, 19, COL.accent, "right"); }
+   },
+   draw(r, big) {
+     if (!this.A) this.reset(); const gap = big ? 24 : 8, ph = big ? r.h - 104 : r.h, pw = (r.w - gap) / 2;
+     this.panel({ x: r.x, y: r.y, w: pw, h: ph }, this.A, false, big); this.panel({ x: r.x + pw + gap, y: r.y, w: pw, h: ph }, this.B, true, big);
+     if (big) { const y = r.y + r.h - 70, h = 62; let x = r.x + (r.w - 1110) / 2; const box = (w, col, a, b) => { ctx.fillStyle = rgba(col, 0.14); ctx.strokeStyle = col; ctx.lineWidth = 2; rr(x, y, w, h, 12); ctx.fill(); ctx.stroke(); tx(a, x + w / 2, y + 27, 20, COL.ink, 700, "center"); tx(b, x + w / 2, y + 50, 15, COL.muted, 500, "center"); x += w; };
+       const gapT = (s, size) => { tx(s, x + 30, y + 40, size || 28, COL.muted, 700, "center"); x += 60; };
+       box(150, COL.muted, "noisy plan", "16 random steps"); gapT("→", 26); box(200, COL.accent, "clean up a little", "one denoising step"); gapT("+", 30); box(280, COL.cost, "nudge", "toward the flag, away from the cone"); gapT("→", 26); box(100, COL.muted, "× 20", "steps"); gapT("→", 26); box(140, COL.accent, "plan", "the next 0.64 s"); }
+   } },
+ { id: "decode", n: 8, title: "Turn the code into joint commands", cap: "The decoder turns the present code and body sense into 29 joint targets, 25 times a second.", slot: { x: 580, y: 632, w: 440, h: 220 }, w: null, gi: 0,
+   update(dt) { if (!this.w) this.w = makeWalker([0, -1.4], 0); const goals = [[0, 1.4], [0, -1.4]], w = this.w, g = goals[this.gi]; walkStep(w, { goal: g, obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, dt); if (Math.hypot(w.p[0] - g[0], w.p[1] - g[1]) < 0.25) this.gi = 1 - this.gi; },
+   draw(r, big) {
+     const w = this.w, z = codeAt(0, w.phase), q = toJoints(w.pose || idle(0)).map((v, i) => clamp((v - Q0[i]) * 1.4, -1, 1));
+     if (big) { const my = r.y + r.h / 2, bw0 = r.w * 0.22; ctx.fillStyle = COL.soft; rr(r.x, my - 150, bw0, 140, 12); ctx.fill(); bars(r.x + 10, my - 140, bw0 - 20, 110, z); tx("code z (32)", r.x + bw0 / 2, my - 162, 18, COL.ink, 700, "center");
+       ctx.fillStyle = COL.soft; rr(r.x, my + 30, bw0, 110, 12); ctx.fill(); bars(r.x + 10, my + 40, bw0 - 20, 90, q.map(v => v * 0.7), { col: COL.muted }); tx("body sense", r.x + bw0 / 2, my + 160, 18, COL.muted, 700, "center");
+       const ex = r.x + bw0 + 50, ew = r.w * 0.12; trap(ex, my - 120, ew, 240, false, COL.accent, "decoder", 19); flowDots(r.x + bw0 + 4, my - 80, ex - 4, my - 30, 3, COL.accent, 5); flowDots(r.x + bw0 + 4, my + 85, ex - 4, my + 30, 3, COL.muted, 5);
+       const ox = ex + ew + 40, ow = r.w * 0.24; ctx.fillStyle = COL.soft; rr(ox, my - 90, ow, 180, 12); ctx.fill(); bars(ox + 10, my - 80, ow - 20, 160, q); tx("29 joint targets", ox + ow / 2, my + 116, 18, COL.ink, 700, "center"); flowDots(ex + ew + 4, my, ox - 4, my, 3, COL.accent, 5);
+       const sx = ox + ow + 40, sr = { x: sx, y: r.y + 20, w: r.x + r.w - sx, h: r.h - 40 }; flowDots(ox + ow + 4, my, sx - 4, my, 3, COL.accent, 5);
+       scene(sr, { tx: w.p[0], ty: 0.62, tz: w.p[1], dist: 3.1, az: 0.9, el: 0.2, cy: 0.52 }, () => { drawShadow(w.J, 1); drawFigure(w.J, { kind: "robot" }); }, { R: 4, radius: 12 }); }
+     else { const my = r.y + r.h / 2, bw0 = r.w * 0.3; bars(r.x, my - 46, bw0, 92, z); const ex = r.x + bw0 + 14, ew = r.w * 0.14; trap(ex, my - 50, ew, 100, false, COL.accent, "", 12); bars(ex + ew + 14, my - 46, r.x + r.w - ex - ew - 14, 92, q); tx("z (32) → 29 joint targets", r.x + r.w / 2, r.y + r.h - 2, 11, COL.muted, 700, "center"); }
+   } },
+ { id: "zero", n: 9, onOpen() { if (this.sub) this.sub[3].next = T + 1.2; }, title: "New tasks, zero retraining", cap: "Joystick, waypoints, obstacle avoidance and inserted moves, all from the same model.", slot: { x: 1050, y: 632, w: 440, h: 220 }, sub: null,
+   init() { this.sub = [
+     { name: "Joystick", w: makeWalker([0, 0], 0), dirs: [[0, 0.8], [0.8, 0], [0, -0.8], [-0.8, 0]], di: 0, t: 0 },
+     { name: "Waypoints", w: makeWalker([0, -1], 0), goal: [1.0, 0.8], t: 0 },
+     { name: "Obstacle avoidance", w: makeWalker([0, -1.8], 0), goal: [0, 1.8], cone: { x: 0.1, z: 0, r: 0.18 } },
+     { name: "Motion inpainting", w: makeWalker([0, -2], 0), next: 2.5, cw: null } ]; },
+   update(dt) { if (!this.sub) this.init(); const [J1, W1, O1, M1] = this.sub;
+     J1.t += dt; if (J1.t > 2.6) { J1.t = 0; J1.di = (J1.di + 1) % 4; } walkStep(J1.w, { joy: J1.dirs[J1.di], wJoy: 0.25, obstacles: [], body: 0.3 }, dt);
+     walkStep(W1.w, { goal: W1.goal, obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, dt); if (Math.hypot(W1.w.p[0] - W1.goal[0], W1.w.p[1] - W1.goal[1]) < 0.22) { W1.t += dt; if (W1.t > 0.8) { W1.t = 0; const a = R() * 6.28; W1.goal = [clamp(W1.w.p[0] + Math.cos(a) * 1.4, -1.5, 1.5), clamp(W1.w.p[1] + Math.sin(a) * 1.4, -1.5, 1.5)]; } }
+     walkStep(O1.w, { goal: O1.goal, obstacles: [O1.cone], body: 0.3, wObs: 1.2, wSlow: 0.06, reach: 0.6 }, dt); if (Math.hypot(O1.w.p[0] - O1.goal[0], O1.w.p[1] - O1.goal[1]) < 0.22) O1.goal = [0, -O1.goal[1]];
+     const m = M1.w; if (M1.cw && T >= M1.cw.t0 && !M1.cw.from) { M1.cw.o = m.p.slice(); M1.cw.keys = [0, 0.25, 0.5, 0.75, 1].map(u => cartwheelJ(u, M1.cw.o, [0, 1])); M1.cw.from = m.J || fk(idle(0), [m.p[0], 0, m.p[1]], m.yaw); }
+     if (M1.cw) { const u = (T - M1.cw.t0) / 1.0; if (u >= 1) { const e = cartwheelJ(1, M1.cw.o, [0, 1]); m.p = [e.pelvis[0], e.pelvis[2]]; m.v = [0, 0.35]; m.yaw = 0; m.pose = null; m.acc = 0; m.exit = { J: e, t: T }; M1.cw = null; M1.next = T + 3.2; } else if (u >= 0) { m.J = cartwheelJ(u, M1.cw.o, [0, 1]); if (u < 0.2) m.J = lerpJ(M1.cw.from, m.J, ease(u / 0.2)); m.p = [m.J.pelvis[0], m.J.pelvis[2]]; return; } }
+     walkStep(m, { goal: [0, m.p[1] + 3], obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, dt); if (m.exit) { const k = (T - m.exit.t) / 0.35; if (k < 1) m.J = lerpJ(m.exit.J, m.J, ease(k)); else m.exit = null; }
+     if (!M1.cw && T > M1.next) { M1.cw = { t0: T + 0.6, o: [m.p[0], m.p[1] + 0.5], from: null }; M1.cw.keys = [0, 0.25, 0.5, 0.75, 1].map(u => cartwheelJ(u, M1.cw.o, [0, 1])); }
+     if (m.p[1] > 6) { M1.w = makeWalker([0, -2], 0); walkStep(M1.w, { goal: [0, 1], obstacles: [], body: 0.3, wObs: 0, wSlow: 0.06 }, 0.001); } },
+   draw(r, big) {
+     if (!this.sub) this.init(); const cols = 2, rows = 2, gap = big ? 18 : 6, cw = (r.w - gap * (cols - 1)) / cols, ch = (r.h - gap * (rows - 1)) / rows;
+     this.sub.forEach((s, i) => { const c = { x: r.x + (i % cols) * (cw + gap), y: r.y + Math.floor(i / cols) * (ch + gap), w: cw, h: ch }, w = s.w, J = w.J || fk(idle(0), [w.p[0], 0, w.p[1]], w.yaw);
+       const follow = i === 0 || i === 3, camC = follow ? { tx: w.p[0], ty: 0.3, tz: w.p[1] + 0.3, dist: big ? 4.2 : 4.4, az: 0.7, el: 0.55, cy: 0.56 } : { tx: 0, ty: 0, tz: 0, dist: big ? 5.2 : 5.6, az: 0.3, el: 0.85, cy: 0.52 };
+       scene(c, camC, () => { w.trail.forEach((q, k) => dot3([q[0], 0.004, q[1]], 0.02, COL.muted, 0.5 * (k + 1) / w.trail.length, 1.5));
+         if (i === 1) drawFlag(s.goal, 1); if (i === 2) { drawFlag(s.goal, 1); } drawShadow(J, 1);
+         if (i === 2) drawCone(s.cone, 1, true);
+         if (i === 0) { const d = s.dirs[s.di], a = proj([w.p[0], 0.02, w.p[1]]), b = proj([w.p[0] + d[0] * 1.3, 0.02, w.p[1] + d[1] * 1.3]); ctx.strokeStyle = COL.cost; ctx.fillStyle = COL.cost; ctx.lineWidth = big ? 6 : 4; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+         if (i === 3 && s.cw && s.cw.keys) s.cw.keys.forEach(K2 => drawFigure(K2, { kind: "ghost", color: COL.cost, alpha: 0.7, markers: false, thin: true }));
+         drawFigure(J, { kind: "robot" }); }, { R: big ? 5 : 3.5, radius: big ? 12 : 8 });
+       pill(s.name, c.x + 10, c.y + 8, big ? 18 : 12, i === 3 ? COL.cost : COL.accent); });
+   } }
+];
+STEPS.forEach(s => { if (s.init) s.init(); });
+/* ================= the click-through controller ================= */
+const POP = { x: 170, y: 96, w: 1260, h: 784 };
+const BANDS = [[100, 244, "Stage 1: learn moves"], [360, 244, "Stage 2: one model"], [620, 244, "New tasks"]];
+const EDGES = [["lafan", "track", ""], ["track", "experts", ""], ["experts", "dagger", "the experts teach one student"], ["dagger", "vae", ""], ["vae", "diff", ""], ["diff", "guide", "the same denoising, now with a nudge for the task"], ["guide", "decode", ""], ["decode", "zero", ""]];
+const FLOWORDER = ["lafan", "track", "experts", "dagger", "vae", "diff", "guide", "decode", "zero"];
+const byId = {}; STEPS.forEach((s, i) => { byId[s.id] = i; });
+let placed = 0, open = -1, review = -1, anims = {}, openedAt = {}, landedAt = {}, bd = 0, finalAt = -9;
+function lerpRect(a, b, t) { return { x: lerp(a.x, b.x, t), y: lerp(a.y, b.y, t), w: lerp(a.w, b.w, t), h: lerp(a.h, b.h, t) }; }
+function animTo(i, from, to, dur, delay, kind, a0, a1) { anims[i] = { from, to, t0: T + (delay || 0), dur, kind, a0: a0 === undefined ? 1 : a0, a1: a1 === undefined ? 1 : a1 }; }
+function stateOf(i) {
+  const an = anims[i]; if (an) { const u = clamp((T - an.t0) / an.dur, 0, 1); if (T < an.t0) return an.a0 > 0 ? { r: an.from, a: an.a0 } : null; const e = an.kind === "pop" ? easeOutBack(u) : ease(u); if (u >= 1) { delete anims[i]; if (an.a1 === 0) return null; return { r: an.to, a: 1 }; } return { r: lerpRect(an.from, an.to, e), a: lerp(an.a0, an.a1, ease(u)) }; }
+  if (i === open || i === review) return { r: POP, a: 1 }; if (i < placed) return { r: STEPS[i].slot, a: 1 }; return null;
+}
+const shrink = s => ({ x: s.x + s.w * 0.3, y: s.y + s.h * 0.3, w: s.w * 0.4, h: s.h * 0.4 });
+function openStep(i, delay) { open = i; openedAt[i] = T + (delay || 0); if (STEPS[i].onOpen) STEPS[i].onOpen(); animTo(i, shrink(STEPS[i].slot), POP, 0.75, delay || 0, "pop", 0, 1); }
+function place(i) { animTo(i, POP, STEPS[i].slot, 0.8, 0, "move"); landedAt[i] = T + 0.8; }
+function next() {
+  if (review >= 0) { animTo(review, POP, STEPS[review].slot, 0.7, 0, "move"); review = -1; return; }
+  if (placed >= STEPS.length && open < 0) { placed = 0; open = -1; anims = {}; landedAt = {}; return; }
+  if (open < 0) { openStep(0, 0); }
+  else { const i = open; place(i); placed = i + 1; if (i + 1 < STEPS.length) openStep(i + 1, 0.35); else { open = -1; finalAt = T + 0.8; } }
+  syncUI();
+}
+function back() {
+  if (review >= 0) { next(); return; }
+  if (open < 0 && placed >= STEPS.length) { placed = STEPS.length - 1; anims[placed] = { from: STEPS[placed].slot, to: POP, t0: T, dur: 0.7, kind: "move", a0: 1, a1: 1 }; open = placed; openedAt[open] = T; syncUI(); return; }
+  if (open < 0) return;
+  const i = open; animTo(i, POP, shrink(STEPS[i].slot), 0.5, 0, "move", 1, 0);
+  if (i === 0) { open = -1; placed = 0; }
+  else { placed = i - 1; open = i - 1; openedAt[open] = T + 0.2; if (STEPS[open].onOpen) STEPS[open].onOpen(); animTo(open, STEPS[open].slot, POP, 0.7, 0.2, "move"); }
+  syncUI();
+}
+const nextB = document.getElementById("next"), backB = document.getElementById("back"), countEl = document.getElementById("count");
+function syncUI() { const done = placed >= STEPS.length && open < 0, land = open < 0 && placed === 0; nextB.textContent = land ? "Start" : done ? "Start over" : "Next"; backB.hidden = land; countEl.textContent = open >= 0 ? `Step ${open + 1} of ${STEPS.length}` : done ? "Complete" : ""; }
+nextB.addEventListener("click", e => { e.stopPropagation(); next(); }); backB.addEventListener("click", e => { e.stopPropagation(); back(); });
+window.addEventListener("keydown", e => { if (e.target.closest && e.target.closest("button")) { if (e.key === " " || e.key === "Enter") return; }
+  if (["ArrowRight", " ", "Enter", "PageDown"].includes(e.key)) { e.preventDefault(); next(); } else if (["ArrowLeft", "PageUp", "Backspace"].includes(e.key)) { e.preventDefault(); back(); }
+  else if (e.key === "Escape" && review >= 0) { next(); }
+  else if (e.key === "Home") { placed = 0; open = -1; review = -1; anims = {}; landedAt = {}; syncUI(); }
+  else if (e.key === "f" || e.key === "F") { if (!document.fullscreenElement) document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); else document.exitFullscreen(); } });
+let scl = 1, offX = 0, offY = 0, CW = 0, CH = 0, DPRx = 1;
+function fit() { DPRx = LITE ? 1 : Math.min(2, window.devicePixelRatio || 1); CW = window.innerWidth; CH = window.innerHeight; cv.width = Math.round(CW * DPRx); cv.height = Math.round(CH * DPRx); scl = Math.min(CW / VW, CH / VH); offX = (CW - VW * scl) / 2; offY = (CH - VH * scl) / 2; }
+window.addEventListener("resize", fit); fit();
+cv.addEventListener("click", e => { const x = (e.clientX - offX) / scl, y = (e.clientY - offY) / scl;
+  if (placed >= STEPS.length && open < 0 && review < 0) { for (let i = 0; i < STEPS.length; i++) { const s = STEPS[i].slot; if (x >= s.x && x <= s.x + s.w && y >= s.y && y <= s.y + s.h) { review = i; openedAt[i] = T; if (STEPS[i].onOpen) STEPS[i].onOpen(); animTo(i, s, POP, 0.7, 0, "move"); return; } } }
+  next(); });
+const root = document.documentElement; document.getElementById("theme").addEventListener("click", e => { e.stopPropagation(); const dark = (root.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark"; root.setAttribute("data-theme", dark ? "light" : "dark"); readColours(); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", readColours);
+/* ---------- drawing the map ---------- */
+function edgeGeom(a, b) { const A = STEPS[byId[a]].slot, B = STEPS[byId[b]].slot;
+  if (Math.abs(A.y - B.y) < 5) { const y = A.y + A.h / 2; return [[A.x + A.w, y], [B.x, y]]; }
+  const x1 = A.x + A.w / 2, yl = (A.y + A.h + B.y) / 2, x2 = B.x + B.w / 2; return [[x1, A.y + A.h], [x1, yl], [x2, yl], [x2, B.y]]; }
+function polyAt(P, u) { const L = []; let tot = 0; for (let i = 1; i < P.length; i++) { const l = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]); L.push(l); tot += l; } let d = u * tot; for (let i = 1; i < P.length; i++) { if (d <= L[i - 1] || i === P.length - 1) { const f = L[i - 1] ? clamp(d / L[i - 1], 0, 1) : 0; return [lerp(P[i - 1][0], P[i][0], f), lerp(P[i - 1][1], P[i][1], f), Math.atan2(P[i][1] - P[i - 1][1], P[i][0] - P[i - 1][0])]; } d -= L[i - 1]; } return [P[P.length - 1][0], P[P.length - 1][1], 0]; }
+function polyPath(P, g) { ctx.beginPath(); ctx.moveTo(P[0][0], P[0][1]); const n = 40; for (let k = 1; k <= n; k++) { const p = polyAt(P, g * k / n); ctx.lineTo(p[0], p[1]); } }
+function drawSkeleton() {
+  EDGES.forEach(([a, b]) => { const ia = byId[a], ib = byId[b]; if (ia < placed && ib < placed) return; const P = edgeGeom(a, b), col = stageCol(STEPS[ia].n);
+    ctx.setLineDash([4, 8]); ctx.strokeStyle = col; ctx.globalAlpha = 0.35; ctx.lineWidth = 2.5; ctx.lineCap = "round"; polyPath(P, 1); ctx.stroke(); ctx.setLineDash([]);
+    const e = polyAt(P, 1), an = e[2]; ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(e[0], e[1]); ctx.lineTo(e[0] - Math.cos(an - 0.5) * 11, e[1] - Math.sin(an - 0.5) * 11); ctx.lineTo(e[0] - Math.cos(an + 0.5) * 11, e[1] - Math.sin(an + 0.5) * 11); ctx.closePath(); ctx.fill();
+    const u = (T * (P.length > 2 ? 0.16 : 0.5) + ia * 0.13) % 1, p = polyAt(P, u); ctx.globalAlpha = 0.45 * Math.sin(u * Math.PI); ctx.beginPath(); ctx.arc(p[0], p[1], 4.5, 0, 7); ctx.fill(); ctx.globalAlpha = 1; });
+}
+function drawEdges(final) {
+  EDGES.forEach(([a, b, label]) => { const ia = byId[a], ib = byId[b]; if (!(ia < placed && ib < placed)) return; const land = Math.max(landedAt[ia] || 0, landedAt[ib] || 0), g = clamp((T - land) / 0.7, 0, 1); if (g <= 0) return;
+    const P = edgeGeom(a, b), col = stageCol(STEPS[ia].n);
+    ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.strokeStyle = rgba(col, 0.3); ctx.lineWidth = 12; polyPath(P, g); ctx.stroke(); ctx.strokeStyle = col; ctx.lineWidth = 3; polyPath(P, g); ctx.stroke();
+    if (g >= 1) { const e = polyAt(P, 1), an = e[2]; ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(e[0], e[1]); ctx.lineTo(e[0] - Math.cos(an - 0.5) * 14, e[1] - Math.sin(an - 0.5) * 14); ctx.lineTo(e[0] - Math.cos(an + 0.5) * 14, e[1] - Math.sin(an + 0.5) * 14); ctx.closePath(); ctx.fill();
+      const n = P.length > 2 ? (final ? 7 : 5) : (final ? 2 : 1); for (let k = 0; k < n; k++) { const u = (T * (P.length > 2 ? 0.22 : 0.7) + k / n) % 1, p = polyAt(P, u); ctx.fillStyle = col; ctx.globalAlpha = 0.95 * Math.sin(u * Math.PI); ctx.beginPath(); ctx.arc(p[0], p[1], final ? 6.5 : 5.5, 0, 7); ctx.fill(); ctx.globalAlpha = 1; }
+      if (label) { const mid = [(P[1][0] + P[2][0]) / 2, P[1][1]]; ctx.font = '700 14px "Instrument Sans", system-ui, sans-serif'; const tw = ctx.measureText(label).width + 20; ctx.fillStyle = COL.bg; rr(mid[0] - tw / 2, mid[1] - 12, tw, 24, 12); ctx.fill(); tx(label, mid[0], mid[1] + 5, 14, col, 700, "center"); } } });
+}
+function drawCard(i, base, big) {
+  const s = STEPS[i], br = big ? 24 : 12, bx = base.x + (big ? 44 : 20), by = base.y + (big ? 50 : 20);
+  ctx.fillStyle = stageCol(s.n); ctx.beginPath(); ctx.arc(bx, by, br, 0, 7); ctx.fill(); tx(String(s.n), bx, by + br * 0.38, br * 1.05, COL.panel, 700, "center");
+  tx(s.title, bx + br + (big ? 18 : 10), by + (big ? 4 : 6), big ? 36 : 18, COL.ink, 700, "left"); if (big) tx(s.cap, bx + br + 18, by + 44, 21, COL.muted, 400, "left");
+  const top = big ? 126 : 40, mx = big ? 30 : 10, cr = { x: base.x + mx, y: base.y + top, w: base.w - 2 * mx, h: base.h - top - (big ? 26 : 8) };
+  s.draw(cr, big, T - (openedAt[i] || 0));
+}
+function drawTile(i, r, alpha) {
+  const s = STEPS[i], k = clamp((r.w - s.slot.w) / (POP.w - s.slot.w), 0, 1), big = k > 0.5, base = big ? POP : s.slot, rad = lerp(14, 24, k);
+  ctx.save(); ctx.globalAlpha = alpha; ctx.shadowColor = "rgba(20,35,50," + (0.08 + 0.18 * k) + ")"; ctx.shadowBlur = 14 + 40 * k; ctx.shadowOffsetY = 4 + 10 * k; ctx.fillStyle = COL.panel; rr(r.x, r.y, r.w, r.h, rad); ctx.fill(); ctx.restore();
+  ctx.save(); rr(r.x, r.y, r.w, r.h, rad); ctx.clip();
+  const u = Math.min(r.w / base.w, r.h / base.h), ox = r.x + (r.w - base.w * u) / 2, oy = r.y + (r.h - base.h * u) / 2;
+  ctx.translate(ox, oy); ctx.scale(u, u); ctx.translate(-base.x, -base.y); drawCard(i, base, big); ctx.restore();
+  ctx.save(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.5; rr(r.x, r.y, r.w, r.h, rad); ctx.stroke(); ctx.restore();
+}
+
+/* ---------- landing page ---------- */
+let landA = 1; const HERO = { ph: 0, rob: null };
+const JOURNEY = [["Stage 1: learn moves", 0, [[1, "Human motion data"], [2, "Track from the torso"], [3, "One expert per move"]]],
+  ["Stage 2: one model", 1, [[4, "Student learns experts"], [5, "A 32-number code"], [6, "Imagine 0.64 s ahead"]]],
+  ["New tasks", 2, [[7, "Nudge toward a task"], [8, "Decode to joints"], [9, "Four new tasks"]]]];
+function fitTx(s, x, y, maxW, size, color, weight, align, alpha) { ctx.font = `${weight || 400} ${size}px "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif`; const w = ctx.measureText(s).width; tx(s, x, y, w > maxW ? size * maxW / w : size, color, weight, align, alpha); }
+function drawLanding(a, dt) {
+  HERO.ph += dt * 2.5; const refA = motion("dance", HERO.ph); HERO.rob = smoothPose(HERO.rob, refA, dt, 7);
+  ctx.fillStyle = COL.bg; ctx.globalAlpha = a; ctx.fillRect(-offX / scl, -offY / scl, CW / scl, CH / scl); ctx.globalAlpha = 1; if (a < 0.02) return;
+  const hr = { x: 1000, y: 84, w: 510, h: 740 }, az = 0.5 + 0.3 * Math.sin(T * 0.12);
+  ctx.save(); ctx.globalAlpha = a; ctx.shadowColor = "rgba(20,35,50,0.16)"; ctx.shadowBlur = 50; ctx.shadowOffsetY = 16; ctx.fillStyle = COL.panel; rr(hr.x, hr.y, hr.w, hr.h, 28); ctx.fill(); ctx.restore();
+  const gJ = fk(refA, [-0.45, 0, -0.1], 0.3), rJ = fk(HERO.rob, [0.45, 0, 0.1], 0.3);
+  scene(hr, { tx: 0, ty: 0.8, tz: 0, dist: 4.1, az, el: 0.15, cy: 0.52 }, () => { drawShadow(gJ, 0.6); drawShadow(rJ, 1); const order = proj(gJ.pelvis)[2] > proj(rJ.pelvis)[2];
+    if (order) { drawFigure(gJ, { kind: "ghost" }); drawFigure(rJ, { kind: "robot" }); } else { drawFigure(rJ, { kind: "robot" }); drawFigure(gJ, { kind: "ghost" }); }
+    const pg = proj(add(gJ.head, [0, 0.3, 0])), pr = proj(add(rJ.head, [0, 0.3, 0])); pill("human", pg[0], pg[1] - 30, 18, COL.ghost, "center"); pill("robot", pr[0], pr[1] - 30, 18, COL.accent, "center");
+    const mx = (pg[0] + pr[0]) / 2, my = Math.min(pg[1], pr[1]) - 64; ctx.setLineDash([3, 9]); ctx.strokeStyle = COL.muted; ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(pg[0] + 36, pg[1] - 34); ctx.quadraticCurveTo(mx, my, pr[0] - 36, pr[1] - 34); ctx.stroke(); ctx.setLineDash([]);
+    tx("copies", mx, my + 10, 15, COL.muted, 700, "center"); }, { R: 6, radius: 28 });
+  if (a < 1) { ctx.fillStyle = COL.bg; ctx.globalAlpha = 1 - a; rr(hr.x - 2, hr.y - 2, hr.w + 4, hr.h + 4, 28); ctx.fill(); ctx.globalAlpha = 1; }
+  fitTx("BeyondMimic", 106, 196, 840, 84, COL.ink, 700, "left", a);
+  fitTx("From Motion Tracking to Versatile Humanoid", 110, 254, 840, 34, COL.ink, 600, "left", a * 0.92); fitTx("Control via Guided Diffusion", 110, 298, 840, 34, COL.ink, 600, "left", a * 0.92);
+  fitTx("Liao et al., 2025  |  UC Berkeley and Stanford  |  Unitree G1 humanoid", 110, 340, 840, 18, COL.muted, 500, "left", a);
+  ctx.globalAlpha = a; ctx.fillStyle = rgba(COL.accent, 0.12); rr(110, 386, 330, 50, 25); ctx.fill(); ctx.strokeStyle = COL.accent; ctx.lineWidth = 2; ctx.stroke(); ctx.globalAlpha = 1; fitTx("Architecture Pipeline", 275, 420, 300, 24, COL.accent, 700, "center", a);
+  JOURNEY.forEach(([head, si, items], gi) => { const x = 110 + gi * 288, y = 470, cw = 270, col = [COL.accent, COL.past, COL.cost][si];
+    ctx.globalAlpha = a; ctx.fillStyle = COL.panel; rr(x, y, cw, 214, 18); ctx.fill(); ctx.strokeStyle = COL.line; ctx.lineWidth = 1.5; ctx.stroke(); ctx.fillStyle = col; rr(x, y, cw, 6, 3); ctx.fill(); ctx.globalAlpha = 1;
+    fitTx(head, x + 20, y + 40, cw - 40, 16, col, 700, "left", a);
+    items.forEach(([n, s], k) => { const yy = y + 86 + k * 44, pulse = 0.5 + 0.5 * Math.sin(T * 2.2 - (n - 1) * 0.7); ctx.globalAlpha = a * (0.72 + 0.28 * pulse); ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x + 34, yy - 6, 14, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+      tx(String(n), x + 34, yy - 0.5, 15, COL.panel, 700, "center", a); fitTx(s, x + 58, yy, cw - 72, 16, COL.ink, 600, "left", a); });
+    if (gi < 2) { ctx.globalAlpha = a; ctx.fillStyle = COL.muted; ctx.beginPath(); ctx.moveTo(x + cw + 5, y + 98); ctx.lineTo(x + cw + 13, y + 106); ctx.lineTo(x + cw + 5, y + 114); ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1; } });
+  const cy = 730, bob = Math.sin(T * 3) * 3; ctx.globalAlpha = a; ctx.fillStyle = COL.accent; rr(110, cy + bob, 340, 58, 29); ctx.fill(); ctx.globalAlpha = 1; fitTx("Click or press → to begin", 280, cy + 37 + bob, 300, 21, COL.panel, 700, "center", a);
+  fitTx("Presented by Ritik Agarwal  |  CSE 598", 480, cy + 36, 470, 17, COL.muted, 600, "left", a);
+  fitTx("Tip: works with a presentation clicker. Press F for full screen.", 110, 830, 840, 14, COL.muted, 500, "left", a * 0.85);
+  fitTx("Illustrative animations of the method in Liao et al., BeyondMimic (arXiv:2508.08241, 2025).", 110, 852, 840, 13, COL.muted, 500, "left", a * 0.75);
+}
+/* ---------- stage colours ---------- */
+const stageCol = n => n <= 3 ? COL.accent : n <= 6 ? COL.past : COL.cost;
+let prevNow = performance.now();
+let warned = false;
+function frame(now) { try { frameBody(now); } catch (err) { if (!warned) { console.warn(err); warned = true; } ctx.restore && ctx.setTransform(1, 0, 0, 1, 0, 0); } requestAnimationFrame(frame); }
+let ft = 0.016, slowFor = 0;
+function frameBody(now) {
+  const dt = Math.min(0.05, (now - prevNow) / 1000); prevNow = now; T += dt;
+  ft = lerp(ft, dt, 0.05); if (!LITE && T > 4) { slowFor = ft > 0.028 ? slowFor + dt : 0; if (slowFor > 2.5) { LITE = true; fit(); } }
+  const states = STEPS.map((_, i) => stateOf(i)); STEPS.forEach((s, i) => { if (states[i]) s.update(dt); });
+  ctx.setTransform(DPRx, 0, 0, DPRx, 0, 0); ctx.fillStyle = COL.bg; ctx.fillRect(0, 0, CW, CH); ctx.setTransform(DPRx * scl, 0, 0, DPRx * scl, DPRx * offX, DPRx * offY);
+  const final = placed >= STEPS.length && open < 0;
+  const onLanding = placed === 0 && open < 0 && review < 0 && !Object.keys(anims).length; landA = lerp(landA, onLanding ? 1 : 0, 1 - Math.exp(-dt * 7));
+  tx(final ? "BeyondMimic: the complete architecture pipeline" : "BeyondMimic: Architecture Pipeline", 110, 54, 30, COL.ink, 700); tx(final ? "Click any block to look inside it again." : "From Motion Tracking to Versatile Humanoid Control via Guided Diffusion", 110, 80, 16, COL.muted, 500);
+  if (!final) { const x0 = 760, gap = 34, cur = open >= 0 ? open : review; for (let k = 0; k < STEPS.length - 1; k++) { ctx.strokeStyle = k < placed - 1 ? stageCol(k + 1) : COL.line; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x0 + k * gap + 9, 50); ctx.lineTo(x0 + (k + 1) * gap - 9, 50); ctx.stroke(); }
+    STEPS.forEach((s, k) => { const x = x0 + k * gap, col = stageCol(s.n), isCur = k === cur, done = k < placed; ctx.fillStyle = done || isCur ? col : COL.panel; ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, 50, isCur ? 12 : 9, 0, 7); ctx.fill(); ctx.stroke();
+      if (isCur) { ctx.globalAlpha = 0.35 + 0.25 * Math.sin(T * 4); ctx.beginPath(); ctx.arc(x, 50, 17, 0, 7); ctx.stroke(); ctx.globalAlpha = 1; } tx(String(s.n), x, 54.5, isCur ? 12.5 : 11, done || isCur ? COL.panel : col, 700, "center"); }); }
+  tx("Illustrative animations of the method in Liao et al., BeyondMimic (arXiv:2508.08241, 2025).", VW - 110, 890, 13, COL.muted, 500, "right", 0.85);
+  BANDS.forEach(([y, h, lab], bi) => { const col = [COL.accent, COL.past, COL.cost][bi]; ctx.fillStyle = mix(COL.band, col, 0.07); rr(24, y, VW - 48, h, 18); ctx.fill();
+    ctx.save(); rr(24, y, VW - 48, h, 18); ctx.clip(); ctx.fillStyle = col; ctx.fillRect(24, y, 7, h); ctx.restore();
+    ctx.font = '700 17px "Instrument Sans", system-ui, sans-serif'; const lw = ctx.measureText(lab).width, fs = lw > h - 30 ? 17 * (h - 30) / lw : 17;
+    ctx.save(); ctx.translate(62, y + h / 2); ctx.rotate(-Math.PI / 2); tx(lab, 0, 6, fs, col, 700, "center"); ctx.restore(); });
+  STEPS.forEach((s, i) => { if (states[i] && !(anims[i] || i === open || i === review)) return; const r = s.slot, col = stageCol(s.n), nextUp = (open < 0 ? placed : open) === i;
+    ctx.fillStyle = COL.panel; ctx.globalAlpha = 0.55; rr(r.x, r.y, r.w, r.h, 14); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.setLineDash([7, 8]); ctx.strokeStyle = col; ctx.globalAlpha = nextUp ? 0.55 + 0.35 * Math.sin(T * 4) : 0.4; ctx.lineWidth = nextUp ? 2.5 : 2; rr(r.x, r.y, r.w, r.h, 14); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+    ctx.fillStyle = col; ctx.globalAlpha = 0.28; ctx.beginPath(); ctx.arc(r.x + r.w / 2, r.y + r.h / 2 - 16, 30, 0, 7); ctx.fill(); ctx.globalAlpha = 1; tx(String(s.n), r.x + r.w / 2, r.y + r.h / 2 - 4, 32, col, 700, "center", 0.85);
+    tx(s.title, r.x + r.w / 2, r.y + r.h / 2 + 46, 17, COL.muted, 600, "center", 0.9); });
+  drawSkeleton(); drawEdges(final);
+  STEPS.forEach((s, i) => { const st = states[i]; if (!st || anims[i] || i === open || i === review) return; drawTile(i, st.r, st.a);
+    if (final) { const fi = FLOWORDER.indexOf(s.id), pulse = fi >= 0 ? Math.max(0, 1 - Math.abs(((T - finalAt) * 1.3) % (FLOWORDER.length + 2) - fi)) : 0; if (pulse > 0) { ctx.strokeStyle = stageCol(s.n); ctx.globalAlpha = pulse; ctx.lineWidth = 4; rr(s.slot.x - 4, s.slot.y - 4, s.slot.w + 8, s.slot.h + 8, 18); ctx.stroke(); ctx.globalAlpha = 1; } } });
+  if (landA > 0.01) drawLanding(landA, dt);
+  const wantBd = open >= 0 || review >= 0 ? 1 : 0; bd = lerp(bd, wantBd, 1 - Math.exp(-dt * 8)); if (bd > 0.01) { ctx.fillStyle = COL.bg; ctx.globalAlpha = 0.72 * bd; ctx.fillRect(-offX / scl, -offY / scl, CW / scl, CH / scl); ctx.globalAlpha = 1; }
+  STEPS.forEach((s, i) => { const st = states[i]; if (!st || !(anims[i] || i === open || i === review)) return; drawTile(i, st.r, st.a); });
+}
+window.__tour = { next, back, get placed() { return placed; }, get open() { return open; } };
+readColours(); syncUI(); requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
